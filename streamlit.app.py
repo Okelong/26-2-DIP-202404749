@@ -132,7 +132,7 @@ with sb.expander("📖 사용 방법"):
         "1. **사진 올리기**\n"
         "2. **사진에 따라 답고르기** \n"
         "3. **오른쪽 결과를 원본과 비교하기.** \n"
-        "4. **추가보정 : '결과가 이상하면'에서 선택하기.**\n"
+        "4. **추가보정을 원한다면 '추가보정'에서 선택하기.**\n"
         "5. **세부조정 : 그 외에도 보정하고 싶은 부분이 있으면 '⚙️ 세부 설정'에서 직접 조정하기.**\n"
         "- **binary mask**: 흰색이 물체로 인식된 부분\n"
     )
@@ -147,7 +147,7 @@ if uploaded is not None:
     for key, (question, opts) in QUESTIONS.items():
         sb.radio(question, opts, key=key, on_change=apply_answers)
 
-    sb.header("③ 결과가 이상하면")
+    sb.header("③ 추가보정")
     sb.caption("오른쪽 결과를 보고 해당하는 상황을 누르세요. 누를 때마다 한 단계씩 조정돼요.")
     for label, kind in SITUATIONS.items():
         sb.button(label, on_click=adjust, args=(kind,), use_container_width=True)
@@ -156,7 +156,7 @@ if uploaded is not None:
     sb.button("↺ 처음 값으로 되돌리기", on_click=apply_answers, use_container_width=True)
 
 # 세부 설정: 질문에 답하면 자동으로 정해짐. 직접 바꿀 때만 펼침
-with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
+with sb.expander("⚙️ 세부 설정"):
     cap = st.caption
     st.markdown("**1. 이미지**")
     max_side = st.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
