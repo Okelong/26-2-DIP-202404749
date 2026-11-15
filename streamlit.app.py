@@ -148,7 +148,7 @@ if uploaded is not None:
         sb.radio(question, opts, key=key, on_change=apply_answers)
 
     sb.header("③ 추가보정")
-    sb.caption("오른쪽 결과를 보고 해당하는 상황을 누르세요. 누를 때마다 한 단계씩 조정돼요.")
+    sb.caption("결과를 보고 해당하는 상황을 누르세요.")
     for label, kind in SITUATIONS.items():
         sb.button(label, on_click=adjust, args=(kind,), use_container_width=True)
     if msg := st.session_state.get("last_change"):
