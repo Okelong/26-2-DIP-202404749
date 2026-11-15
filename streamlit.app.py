@@ -9,40 +9,80 @@ import streamlit as st
 
 st.set_page_config(page_title="Object Counting", layout="wide")
 st.title("🔍 Object Counting (Connected Components)")
-st.caption("사진을 올리고 영상 유형을 고른 뒤, 결과를 보고 '지금 상황 고르기'로 조정해 보세요.")
+st.caption("사진을 올리고 왼쪽 질문에 답한 뒤, 결과를 보고 '지금 상황 고르기'로 조정해 보세요.")
 
-# ---------------- 기본값 / 영상 유형 프리셋 ----------------
+# ---------------- 기본값 / 사진에 대한 질문 ----------------
 DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
-                direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0,
+                direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0, bg_margin=20,
                 close_k=9, fill=True, open_k=5, min_pct=0.05, connectivity="8-연결",
                 area_est=False)
-PRESETS = {
-    "흰 배경 + 어두운 물체 (예: 화장품, 동전)": {},
-    "흰 배경 + 빽빽하게 붙은 물체 (예: 동전 여러 개)": dict(close_k=3, open_k=11),
-    "어두운 배경 + 밝은 물체 (예: 면봉)": dict(direction="밝다 (f > th)", close_k=3, open_k=5),
-    "무늬 있는 바닥 + 밝은 물체 (예: 보도블록 위 낙엽)": dict(
-        direction="밝다 (f > th)", close_k=3, open_k=3, min_pct=0.02),
-    "어두운 바닥 + 작고 흰 물체가 흩어짐 (예: 떨어진 은행잎)": dict(
-        direction="밝다 (f > th)", th_mode="직접 지정", th_val=170, close_k=3, open_k=0, min_pct=0.004),
+# 사진에 대한 질문: 일반 사용자도 답할 수 있는 질문으로 슬라이더 값을 정함
+QUESTIONS = {
+    "q_bg": ("배경은 어떤 색인가요?", ["밝다 (흰색, 밝은 회색)", "어둡다 (검정, 짙은 회색)"]),
+    "q_texture": ("배경에 무늬나 결이 있나요? (바닥 틈, 천 질감 등)", ["없다 (매끈함)", "있다"]),
+    "q_similar": ("배경과 밝기가 비슷한 물체가 섞여 있나요? (흰 배경 위 흰 물체 등)", ["없다", "있다"]),
+    "q_small": ("물체 크기는 어떤가요?", ["보통 (손가락 마디 이상)", "아주 작다 (점처럼 흩어짐)"]),
+    "q_touch": ("물체끼리 붙어 있나요?", ["대부분 떨어져 있다", "붙어 있는 곳이 많다"]),
+    "q_same": ("물체들의 크기가 모두 비슷한가요? (동전, 레고, 면봉 등)", ["제각각이다", "거의 같다"]),
 }
+for k, (_, opts) in QUESTIONS.items():
+    st.session_state.setdefault(k, opts[0])
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
 
-def apply_preset():
-    st.session_state.pop("last_change", None)
-    for k, v in {**DEFAULTS, **PRESETS[st.session_state["preset"]]}.items():
+def apply_answers():
+    """질문 답 → 슬라이더 값. 지금까지 테스트한 사진들(화장품, 은행잎, 레고 등)로 정한 규칙"""
+    ss = st.session_state
+    bright_bg = ss["q_bg"].startswith("밝")
+    texture = ss["q_texture"].startswith("있")
+    similar = ss["q_similar"].startswith("있")
+    small = ss["q_small"].startswith("아주")
+    touch = ss["q_touch"].startswith("붙")
+    same = ss["q_same"].startswith("거의")
+
+    cfg = dict(DEFAULTS)
+    # 밝은 배경이면 물체가 더 어둡고, 어두운 배경이면 물체가 더 밝음
+    cfg["direction"] = "어둡다 (f < th)" if bright_bg else "밝다 (f > th)"
+    # 임계값: 배경과 비슷한 물체가 있으면 배경 바로 옆에서 자름, 아주 작은 밝은 물체는 높게 직접 지정
+    if similar:
+        cfg["th_mode"] = "배경 기준 자동"
+    elif small and not bright_bg:
+        cfg.update(th_mode="직접 지정", th_val=170)
+    # 무늬가 있으면 노이즈 제거를 세게 (단, 아주 작은 물체는 같이 지워지므로 그대로)
+    if texture and not small:
+        cfg["med_k"] = 7
+    # 모폴로지
+    cfg["close_k"] = 3 if (small or touch or texture) else 5
+    cfg["open_k"] = 0 if small else (3 if texture else 5)
+    if touch and not small:
+        cfg["open_k"] += 4
+    # 최소 면적
+    cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
+    # 크기가 같은 물체가 붙어 있으면 면적으로 개수 보정
+    cfg["area_est"] = same and touch
+    for k, v in cfg.items():
         if k != "max_side":
-            st.session_state[k] = v
+            ss[k] = v
+    ss.pop("last_change", None)
+
+
+if "answers_applied" not in st.session_state:  # 처음 열었을 때 기본 답 기준 값으로 시작
+    apply_answers()
+    st.session_state["answers_applied"] = True
 
 
 # ---------------- Sidebar: 파라미터 ----------------
 cap = st.sidebar.caption  # 설명을 물음표 대신 화면에 바로 표시
 
-st.sidebar.header("0. 영상 유형")
-cap("가장 비슷한 유형을 고르면 아래 값들이 한 번에 바뀝니다. "
-    "그다음 결과 아래의 **지금 상황 고르기**로 미세 조정하세요.")
-st.sidebar.selectbox("영상 유형", list(PRESETS), key="preset", on_change=apply_preset)
+st.sidebar.header("0. 사진에 대해 알려주세요")
+cap("사진을 보고 아래 질문에 답하면, 1~5번 값이 그 사진에 맞게 **자동으로 설정**돼요. "
+    "보통은 여기만 답하고 결과를 확인하면 돼요.")
+for key, (question, opts) in QUESTIONS.items():
+    st.sidebar.radio(question, opts, key=key, on_change=apply_answers)
+st.sidebar.divider()
+cap("아래 1~5번은 자동으로 정해진 값이에요. 결과가 이상할 때만 직접 바꾸거나, "
+    "결과 아래 **지금 상황 고르기** 버튼을 쓰세요.")
 
 st.sidebar.header("1. 이미지")
 cap("**기능** 사진을 grayscale로 불러오고, 빠른 처리를 위해 긴 변을 정해진 크기로 줄여요.")
@@ -65,10 +105,15 @@ cap("**기능** 밝기 기준(임계값)으로 픽셀을 물체 / 배경으로 �
 direction = st.sidebar.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
 cap("**언제** 흰 배경 위 물체면 '어둡다', 어두운 배경 위 밝은 물체면 '밝다'를 고르세요. "
     "바닥의 틈이나 그림자가 같이 잡히면 방향이 맞는지 먼저 확인하세요.")
-th_mode = st.sidebar.radio("임계값 방식", ["Otsu 자동", "직접 지정"], horizontal=True, key="th_mode")
-if th_mode == "직접 지정":
+th_mode = st.sidebar.radio("임계값 방식", ["Otsu 자동", "배경 기준 자동", "직접 지정"], key="th_mode")
+if th_mode == "배경 기준 자동":
+    bg_margin = st.sidebar.slider("배경에서 떨어진 정도", 3, 80, step=1, key="bg_margin")
+    cap("히스토그램에서 가장 많은 밝기(= 배경)를 찾고, 거기서 이만큼 떨어진 곳을 임계값으로 써요. "
+        "배경과 비슷한 밝은 물체까지 잡을 때 써요. 값이 작을수록 배경에 가까운 물체까지 잡혀요.")
+elif th_mode == "직접 지정":
     th_val = st.sidebar.slider("임계값", 0, 255, key="th_val")
-    cap("히스토그램의 빨간 선 위치예요. 선 기준으로 물체 쪽과 배경 쪽이 나뉘어요.")
+    cap("히스토그램의 빨간 선 위치예요. 선 기준으로 물체 쪽과 배경 쪽이 나뉘어요. "
+        "배경과 비슷한 밝은 물체까지 잡으려면 배경 봉우리 바로 옆까지 선을 옮기세요.")
 else:
     th_offset = st.sidebar.slider("Otsu 값 보정 (±)", -60, 60, step=1, key="th_offset")
     cap("Otsu가 구한 값에 더하거나 빼요. 물체가 덜 잡히거나 배경이 잡히면 조금씩 움직여 보세요.")
@@ -137,6 +182,21 @@ def show(img, cmap="gray", title=None, colorbar=False):
 
 
 # ---------------- 메인 ----------------
+with st.expander("📖 사용 방법 (처음이면 읽어 주세요)", expanded=uploaded is None):
+    st.markdown(
+        "1. **왼쪽에서 사진을 올리세요.**\n"
+        "2. **'0. 사진에 대해 알려주세요'의 질문에 답하세요.** 사진을 보고 고르기만 하면 "
+        "나머지 값은 자동으로 정해져요.\n"
+        "3. **'4. Connected components'에서 결과를 확인하세요.** 물체마다 색과 번호가 붙어요. "
+        "원본과 비교해서 빠진 물체, 하나로 붙은 물체, 쪼개진 물체가 있는지 보세요.\n"
+        "4. **이상한 곳이 있으면 결과 아래 '지금 상황 고르기'에서 해당 버튼을 누르세요.** "
+        "누를 때마다 값이 한 단계씩 조정돼요. 결과가 나빠지면 '처음 값으로 되돌리기'를 누르세요.\n\n"
+        "**결과 보는 요령**\n"
+        "- **3번 binary mask**에서 흰색이 물체로 인식된 부분이에요. 물체가 하얗게, 배경이 까맣게 나와야 해요.\n"
+        "- **히스토그램의 빨간 선**이 임계값이에요. 선 한쪽이 물체, 반대쪽이 배경으로 나뉘어요.\n"
+        "- 번호 옆에 **(x2)**가 붙으면 붙어 있는 물체를 면적으로 계산해서 2개로 센 거예요."
+    )
+
 if uploaded is None:
     st.info("👈 왼쪽 사이드바에서 이미지를 업로드하세요.")
     st.stop()
@@ -149,6 +209,10 @@ with st.spinner("노이즈 제거 중..."):
 if th_mode == "Otsu 자동":
     th_val = int(np.clip(otsu(f_denoised) + th_offset, 0, 255))
     st.sidebar.success(f"Otsu 임계값: {th_val}")
+elif th_mode == "배경 기준 자동":
+    bg_level = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))  # 히스토그램 최빈값 = 배경 밝기
+    th_val = int(np.clip(bg_level - bg_margin if direction.startswith("어둡") else bg_level + bg_margin, 0, 255))
+    st.sidebar.success(f"배경 밝기 {bg_level} → 임계값 {th_val}")
 
 # 1~2. 원본 / 노이즈 제거
 st.subheader("1–2. 입력 영상 & 노이즈 제거")
@@ -261,6 +325,7 @@ SITUATIONS = {
     "작거나 얇은 물체가 사라졌어요": "thin_lost",
 }
 NAMES = {"open_k": "Opening", "close_k": "Closing", "th_offset": "Otsu 보정", "th_val": "임계값",
+         "bg_margin": "배경에서 떨어진 정도",
          "med_k": "Median 크기", "min_pct": "최소 면적"}
 
 
@@ -273,7 +338,10 @@ def adjust(kind):
     before = {k: ss.get(k) for k in NAMES}
     # 임계값을 '물체가 더/덜 잡히는 쪽'으로 움직이는 방향 (어두운 물체면 값을 올려야 더 잡힘)
     more = 1 if ss["direction"].startswith("어둡") else -1
-    th_key, th_lo, th_hi = (("th_offset", -60, 60) if ss["th_mode"] == "Otsu 자동" else ("th_val", 0, 255))
+    th_key, th_lo, th_hi = {"Otsu 자동": ("th_offset", -60, 60), "직접 지정": ("th_val", 0, 255),
+                            "배경 기준 자동": ("bg_margin", 3, 80)}[ss["th_mode"]]
+    if ss["th_mode"] == "배경 기준 자동":
+        more = -1  # 배경 기준: 간격을 줄일수록 물체가 더 잡힘
     if kind == "merged":
         _set("open_k", ss["open_k"] + 4, 0, 51)
         _set("close_k", ss["close_k"] - 4, 0, 51)
@@ -302,7 +370,7 @@ for i, (label, kind) in enumerate(SITUATIONS.items()):
 if msg := st.session_state.get("last_change"):
     st.info(f"**조정됨** {msg}")
 st.caption("배경·무늬까지 잡히면 먼저 사이드바 3번의 **물체가 배경보다…** 방향이 맞는지 확인하세요.")
-st.button("처음 값으로 되돌리기", on_click=apply_preset)
+st.button("처음 값으로 되돌리기 (질문 답 기준)", on_click=apply_answers)
 
 # 5. 최대 / 최소 컴포넌트
 st.subheader("5. 가장 큰 / 가장 작은 component")
