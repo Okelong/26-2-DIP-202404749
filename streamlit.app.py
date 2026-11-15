@@ -6,7 +6,7 @@ import scipy.signal as signal
 import scipy.ndimage as nd
 from PIL import Image, ImageOps
 import streamlit as st
-
+from scipy.spatial import ConvexHull  # [추가] 오목한 정도(solidity) 계산용 (scipy에 포함)
 
 st.set_page_config(page_title="Object Counting", layout="wide")
 st.title("🔍 Object Counting")
@@ -75,6 +75,35 @@ def otsu(img):
     return int(np.nanargmax(sigma_b))
 
 
+def li_threshold(img, tol=0.5):
+    # [추가] Li 임계값: 물체/배경 평균을 반복해서 갱신하며 cross-entropy를 최소화
+    x = img.astype(float).ravel()
+    t = x.mean()
+    for _ in range(100):
+        fg, bg = x[x > t], x[x <= t]
+        if fg.size == 0 or bg.size == 0:
+            break
+        m_f, m_b = max(fg.mean(), 1e-6), max(bg.mean(), 1e-6)
+        t_new = (m_b - m_f) / (np.log(m_b) - np.log(m_f)) if m_f != m_b else t
+        if abs(t_new - t) < tol:
+            t = t_new
+            break
+        t = t_new
+    return t
+
+
+def solidity(region):
+    # [추가] 면적 / 볼록껍질 면적. 1에 가까우면 볼록한 단일 물체, 작으면 여러 물체가 붙은 오목한 덩어리
+    ys, xs = np.nonzero(region)
+    if len(ys) < 3:
+        return 1.0
+    pts = np.concatenate([np.c_[xs + dx, ys + dy] for dx in (-0.5, 0.5) for dy in (-0.5, 0.5)])
+    try:
+        return len(ys) / ConvexHull(pts).volume  # 2D에서 volume = 넓이
+    except Exception:
+        return 1.0
+
+
 def disk(size):
     # [추가] 원형 구조요소. 정사각형은 모서리 방향으로 더 많이 붙여서 대각선 이웃끼리 잘 붙음
     r = size // 2
@@ -112,27 +141,31 @@ def estimate_background(f):
 
 
 def split_touching(labels, solidity_th, min_dist):
-    # [추가] 오목한 덩어리(= 여러 물체가 붙은 것)만 distance transform + watershed로 분리.
+    # [추가] 오목한 덩어리(= 여러 물체가 붙은 것)만 distance transform 기반으로 분리.
     #        립스틱처럼 길쭉해도 볼록한 단일 물체는 solidity가 높아서 그대로 둠
     out = np.zeros_like(labels)
     nxt = 1
-    for p in measure.regionprops(labels):
-        r0, c0, r1, c1 = p.bbox
-        sub = np.pad(p.image, 1)
+    for i, sl in enumerate(nd.find_objects(labels), 1):
+        if sl is None:
+            continue
+        sub = np.pad(labels[sl] == i, 1)
+        area = int(sub.sum())
         parts = None
-        if p.solidity < solidity_th:
+        if solidity(sub) < solidity_th:
             dist = nd.distance_transform_edt(sub)
             peaks = (dist == nd.maximum_filter(dist, size=2 * min_dist + 1)) & (dist > 0.3 * dist.max())
             markers, nm = nd.label(peaks)
             if nm > 1:
-                ws = segmentation.watershed(-dist, markers, mask=sub)
-                areas = np.bincount(ws.ravel())[1:]
-                if areas.min() >= 0.1 * p.area:  # 너무 작은 조각이 생기면 과분할로 보고 취소
+                # 물체 픽셀마다 가장 가까운 중심(marker)에 배정 → 중심끼리의 경계에서 덩어리가 나뉨
+                _, (iy, ix) = nd.distance_transform_edt(markers == 0, return_indices=True)
+                ws = markers[iy, ix] * sub
+                areas = np.bincount(ws[ws > 0].ravel(), minlength=nm + 1)[1:]
+                if areas.min() >= 0.1 * area:            # 너무 작은 조각이 생기면 과분할로 보고 취소
                     parts = [ws == k for k in range(1, nm + 1)]
         if parts is None:
             parts = [sub]
         for part in parts:
-            out[r0:r1, c0:c1][part[1:-1, 1:-1]] = nxt
+            out[sl][part[1:-1, 1:-1]] = nxt
             nxt += 1
     return out, nxt - 1
 
@@ -170,8 +203,7 @@ if th_mode == "자동":
     # [변경] 배경 보정 영상은 0 근처에 큰 봉우리 + 긴 꼬리 모양이라 Otsu(봉우리 2개 가정)는 너무 높게 잡음
     #        → 이런 분포에 강한 Li 방법 사용. 배경 보정을 끄면 기존 Otsu
     if bg_corr:
-        from skimage.filters import threshold_li
-        th_val = int(threshold_li(f_th) * th_scale)
+        th_val = int(li_threshold(f_th) * th_scale)
         st.sidebar.success(f"Li 자동 임계값: {th_val}")
     else:
         th_val = int(otsu(f_th) * th_scale)
@@ -262,9 +294,8 @@ with c1:
     ax.imshow(f, cmap="gray")
     ax.imshow(np.ma.masked_where(labels == 0, labels), cmap=plt.matplotlib.colors.ListedColormap(colors),
               alpha=0.6, interpolation="nearest", vmin=0, vmax=nums)
-    for p in measure.regionprops(labels):
-        y, x = p.centroid
-        ax.text(x, y, str(p.label), color="white", fontsize=9, weight="bold", ha="center", va="center",
+    for lab, (y, x) in zip(idx, nd.center_of_mass(labels > 0, labels, idx)):
+        ax.text(x, y, str(lab), color="white", fontsize=9, weight="bold", ha="center", va="center",
                 bbox=dict(boxstyle="round,pad=0.15", fc="black", alpha=0.6, lw=0))
     ax.axis("off")
     st.pyplot(fig)
