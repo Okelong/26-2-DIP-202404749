@@ -7,8 +7,9 @@ import scipy.ndimage as nd
 from PIL import Image, ImageOps
 import streamlit as st
 
+
 st.set_page_config(page_title="Object Counting", layout="wide")
-st.title("🔍 Object Counting (Connected Components)")
+st.title("🔍 Object Counting")
 st.caption("사진을 올리고 사이드바에서 전처리·임계값·모폴로지 파라미터를 조정해 보세요.")
 
 # ---------------- Sidebar: 파라미터 ----------------
