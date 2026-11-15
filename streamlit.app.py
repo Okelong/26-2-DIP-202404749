@@ -34,80 +34,93 @@ for k, v in DEFAULTS.items():
 
 
 def apply_preset():
+    st.session_state.pop("last_change", None)
     for k, v in {**DEFAULTS, **PRESETS[st.session_state["preset"]]}.items():
         if k != "max_side":
             st.session_state[k] = v
 
 
+cap = st.sidebar.caption  # [추가] 설명을 물음표 대신 화면에 바로 표시
+
 st.sidebar.header("0. 영상 유형")
-st.sidebar.selectbox("가장 비슷한 유형을 고르세요", list(PRESETS), key="preset", on_change=apply_preset,
-                     help="고르면 아래 값들이 그 유형에 맞게 자동으로 바뀝니다. 결과 아래의 안내를 보고 미세 조정하세요.")
+cap("가장 비슷한 유형을 고르면 아래 값들이 그 유형에 맞게 한 번에 바뀝니다. "
+    "그다음 결과 아래의 **지금 상황 고르기**로 미세 조정하세요.")
+st.sidebar.selectbox("영상 유형", list(PRESETS), key="preset", on_change=apply_preset)
 
 st.sidebar.header("1. 이미지")
+cap("**기능** 사진을 grayscale로 불러오고, 빠른 처리를 위해 긴 변을 정해진 크기로 줄여요.")
 uploaded = st.sidebar.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"])
 # [변경] 기본값 1500 → 1000. 모폴로지 크기 같은 px 단위 파라미터는 해상도가 바뀌면 의미가 달라지므로
 #        기본 해상도를 고정해 두고 웬만하면 건드리지 않는 게 안정적
-max_side = st.sidebar.slider("처리용 최대 변 길이 (px, 속도용 리사이즈)", 256, 4000, step=64, key="max_side",
-                             help="바꾸면 아래 모폴로지 크기도 같이 조정해야 합니다.")
+max_side = st.sidebar.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
+cap("**언제** 보통은 그대로 두세요. 바꾸면 아래 크기 값들의 의미도 같이 바뀌어요.")
 
 st.sidebar.header("2. 노이즈 제거")
-denoise = st.sidebar.selectbox("필터", ["Median", "Gaussian", "없음"], key="denoise",
-                               help="배경 표면이 오돌토돌해서 잡티가 많이 잡히면 Median 크기를 키우세요.")
+cap("**기능** 사진의 자글자글한 잡티를 흐리게 지워요.\n\n"
+    "**언제** 배경 표면이 오돌토돌해서 잡티가 물체로 많이 잡히면 크기를 키우세요. "
+    "너무 키우면 작은 물체와 경계가 뭉개져요.")
+denoise = st.sidebar.selectbox("필터", ["Median", "Gaussian", "없음"], key="denoise")
 if denoise == "Median":
     med_k = st.sidebar.slider("Median kernel 크기 (홀수)", 1, 21, step=2, key="med_k")
 elif denoise == "Gaussian":
     sigma = st.sidebar.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
 
 st.sidebar.header("3. Thresholding")
+cap("**기능** 밝기 기준(임계값)으로 픽셀을 물체 / 배경으로 나눠 binary mask를 만들어요.")
 # [추가] 배경 보정: 조명 불균일 + 배경보다 밝은/어두운 물체를 한 번에 처리
-bg_corr = st.sidebar.checkbox("배경 보정 (|영상 − 배경|)", key="bg_corr",
-                              help="조명이 고르지 않을 때 켜세요. 물체가 화면을 빽빽하게 채우면 "
-                                   "배경 추정이 틀어지므로 끄세요.")
+bg_corr = st.sidebar.checkbox("배경 보정 (|영상 − 배경|)", key="bg_corr")
+cap("**언제** 조명이 고르지 않을 때(한쪽이 어두운 사진) 켜세요. "
+    "물체가 화면을 빽빽하게 채우면 배경을 잘못 추정하므로 끄세요.")
 if bg_corr:
     # [추가] 물체 밝기 방향. 예) 보도블록 위 은행잎: 잎은 밝고 블록 틈은 어두움 → "밝음"만 골라야 틈이 안 잡힘
-    polarity = st.sidebar.radio("물체가 배경보다…", ["밝다", "어둡다", "둘 다"], horizontal=True, key="polarity",
-                                help="배경과 다른 밝기의 무늬(틈, 그림자 등)가 같이 잡히면 물체 쪽 방향만 고르세요.")
+    polarity = st.sidebar.radio("물체가 배경보다…", ["밝다", "어둡다", "둘 다"], horizontal=True, key="polarity")
+    cap("바닥의 틈이나 그림자처럼 물체가 아닌 무늬가 같이 잡히면, 물체 쪽 방향만 고르세요.")
+else:
+    direction = st.sidebar.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
 th_mode = st.sidebar.radio("임계값 방식", ["자동", "직접 지정"], horizontal=True, key="th_mode")
 if th_mode == "직접 지정":
-    th_val = st.sidebar.slider("임계값", 0, 255, key="th_val",
-                               help="히스토그램의 빨간 선 위치예요. 물체가 덜 잡히면 낮추고, 배경이 잡히면 올리세요.")
+    th_val = st.sidebar.slider("임계값", 0, 255, key="th_val")
+    cap("히스토그램의 빨간 선 위치예요. 물체가 덜 잡히면 내리고, 배경이 잡히면 올리세요.")
 else:
-    th_scale = st.sidebar.slider("자동 임계값 배율", 0.3, 2.0, step=0.05, key="th_scale",
-                                 help="물체가 덜 잡히면 낮추고, 배경 잡티가 잡히면 올리세요.")
-if not bg_corr:
-    direction = st.sidebar.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
+    th_scale = st.sidebar.slider("자동 임계값 배율", 0.3, 2.0, step=0.05, key="th_scale")
+    cap("자동으로 구한 값에 곱해요. 물체가 덜 잡히면 내리고, 배경 잡티가 잡히면 올리세요.")
 
 st.sidebar.header("4. 모폴로지")
+cap("**기능** binary mask의 모양을 다듬어요. Closing → 구멍 채우기 → Opening 순서로 적용해요.")
 # [변경] 정사각형 → 원형 구조요소, 순서 closing → fill → opening
-close_k = st.sidebar.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k",
-                            help="한 물체가 여러 조각으로 세어지면 키우고, 옆 물체와 붙으면 줄이세요. "
-                                 "물체 사이 간격보다 작게 잡는 게 기준이에요.")
+close_k = st.sidebar.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k")
+cap("**언제** 한 물체가 여러 조각으로 세어지면 키우세요. 옆 물체와 붙어 버리면 줄이세요.")
 fill = st.sidebar.checkbox("Hole filling", key="fill")
-open_k = st.sidebar.slider("Opening 크기 (얇은 연결 끊기)", 0, 51, step=2, key="open_k",
-                           help="물체끼리 붙어 있으면 키우세요. 가장 얇은 물체의 두께보다 작게 잡아야 "
-                                "물체가 사라지지 않아요.")
+cap("**언제** 물체 안쪽에 구멍(글씨, 반사광)이 뚫려 있으면 켜 두세요.")
+open_k = st.sidebar.slider("Opening 크기 (얇은 연결 끊기)", 0, 51, step=2, key="open_k")
+cap("**언제** 물체끼리 그림자나 가는 부분으로 이어져 있으면 키우세요. "
+    "가장 얇은 물체보다 크게 잡으면 그 물체가 사라져요.")
 
 st.sidebar.header("5. 컴포넌트 필터")
+cap("**기능** 이어진 덩어리마다 번호를 매기고(connected component), 너무 작은 덩어리는 버려요.")
 # [변경] 절대 픽셀 수 → 영상 대비 %. 해상도가 달라도 같은 의미
-min_pct = st.sidebar.slider("최소 면적 (영상 대비 %)", 0.0, 2.0, step=0.01, key="min_pct",
-                            help="작은 잡티가 객체로 세어지면 올리세요. 진짜 작은 물체가 사라지면 내리세요.")
+min_pct = st.sidebar.slider("최소 면적 (영상 대비 %)", 0.0, 2.0, step=0.01, key="min_pct")
+cap("**언제** 작은 잡티가 객체로 세어지면 올리세요. 진짜 작은 물체가 사라지면 내리세요.")
 connectivity = st.sidebar.radio("연결성", ["8-연결", "4-연결"], horizontal=True, key="connectivity")
+cap("8-연결은 대각선으로 닿은 픽셀도 같은 덩어리로 봐요. 보통 8-연결을 쓰세요.")
 
 # [추가] 붙은 물체 분리
 st.sidebar.header("6. 붙은 물체 분리")
+cap("**기능** 서로 맞닿아서 하나로 이어진 덩어리를 여러 물체로 나눠요.")
 do_split = st.sidebar.checkbox("Watershed로 분리", key="do_split")
+cap("**언제** 물체끼리 붙어 있는 사진이면 켜세요. 과제용으로 순수한 connected component만 볼 때는 끄세요.")
 solidity_th = st.sidebar.slider("분리 대상 기준 (solidity)", 0.5, 1.0, step=0.01, disabled=not do_split,
-                                key="solidity_th",
-                                help="붙은 덩어리가 안 나뉘면 올리고, 멀쩡한 물체가 쪼개지면 내리세요.")
+                                key="solidity_th")
+cap("덩어리가 이 값보다 오목하면 붙은 물체로 보고 나눠요. 붙은 덩어리가 안 나뉘면 올리고, "
+    "멀쩡한 물체가 쪼개지면 내리세요.")
+min_dist = st.sidebar.slider("물체 중심 최소 간격 (px)", 3, 100, disabled=not do_split, key="min_dist")
+cap("물체 반지름보다 조금 작게 잡는 게 기준이에요. 한 물체가 여러 개로 쪼개지면 키우고, "
+    "붙은 물체가 덜 나뉘면 줄이세요.")
 # [추가] 같은 종류 물체(면봉, 동전 등)는 크기가 거의 같음 → 덩어리 면적 / 물체 1개 면적으로 몇 개가 붙었는지 추정.
 #        X자로 교차하거나 나란히 딱 붙어서 모양으로는 못 나누는 경우를 해결
-area_est = st.sidebar.checkbox("면적으로 개수 보정 (같은 종류 물체일 때)", key="area_est",
-                               help="면봉처럼 크기가 비슷한 물체만 있을 때 켜세요. "
-                                    "물체 1개 크기(중앙값)의 약 2배인 덩어리는 2개로 셉니다. "
-                                    "크기가 제각각인 물체(화장품, 낙엽 등)에는 끄세요.")
-min_dist = st.sidebar.slider("물체 중심 최소 간격 (px)", 3, 100, disabled=not do_split, key="min_dist",
-                             help="한 물체가 여러 개로 쪼개지면 키우고, 붙은 물체가 덜 나뉘면 줄이세요. "
-                                  "물체 반지름보다 조금 작게 잡는 게 기준이에요.")
+area_est = st.sidebar.checkbox("면적으로 개수 보정 (같은 종류 물체일 때)", key="area_est")
+cap("**언제** 면봉처럼 크기가 비슷한 물체만 있을 때 켜세요. 보통 크기의 2배인 덩어리를 2개로 셉니다. "
+    "X자로 교차하거나 나란히 딱 붙은 물체도 셀 수 있어요. 크기가 제각각인 물체에는 끄세요.")
 
 
 # ---------------- 처리 함수 ----------------
@@ -371,31 +384,70 @@ with c2:
     st.download_button("CSV 다운로드", cc.to_csv(index=False).encode("utf-8-sig"),
                        "components.csv", "text/csv")
 
-# [추가] 결과를 보고 다음에 무엇을 조절할지 안내
-tips = []
-img_area = f.size
-mask_ratio = f_mask.mean()
-med_area = float(np.median(areas))
-if mask_ratio > 0.6:
-    tips.append("화면의 절반 이상이 물체로 잡혔어요. 배경까지 잡힌 거예요 → **물체 밝기 방향**을 바꾸거나 "
-                "**임계값 배율**을 올려 보세요. 물체가 빽빽한 영상이면 **배경 보정**을 끄세요.")
-if areas.max() > 0.3 * img_area:
-    tips.append("하나의 덩어리가 화면의 30% 이상이에요. 여러 물체가 하나로 붙었어요 → "
-                "**Closing**을 줄이고 **Opening**을 키워 보세요.")
-elif nums >= 3 and areas.max() > 4 * med_area:
-    tips.append(f"가장 큰 객체(#{idx[np.argmax(areas)]})가 보통 크기의 {areas.max() / med_area:.1f}배예요. "
-                "여러 물체가 붙어 있을 수 있어요 → **Opening**을 키우거나 **분리 대상 기준**을 올려 보세요. "
-                "모두 같은 종류 물체라면 **면적으로 개수 보정**을 켜세요.")
-if nums >= 5 and (areas < 0.15 * med_area).sum() >= 3:
-    tips.append(f"보통 크기의 15%도 안 되는 작은 조각이 {(areas < 0.15 * med_area).sum()}개 있어요. "
-                "잡티이거나 물체가 쪼개진 거예요 → 잡티면 **최소 면적**을 올리고, "
-                "물체가 쪼개진 거면 **Closing**을 키우세요.")
-if nums == 1:
-    tips.append("객체가 1개만 나왔어요. 물체 밝기 방향과 임계값이 맞는지 3번 binary mask를 확인하세요.")
-if tips:
-    st.info("**조절 안내**\n\n" + "\n\n".join(f"- {t}" for t in tips))
-else:
-    st.success("특별히 이상한 점은 없어요. 원본과 비교해서 빠진 물체나 잘못 나뉜 물체만 확인하세요.")
+# [추가] 지금 상황 고르기: 결과를 보고 해당하는 상황을 누르면 관련 값이 한 단계씩 자동 조정됨
+st.markdown("#### 지금 상황 고르기")
+st.caption("원본과 결과를 비교해서 해당하는 상황을 누르세요. 누를 때마다 관련 값이 한 단계씩 조정돼요. "
+           "여러 번 눌러도 되고, 여러 상황을 차례로 눌러도 돼요.")
+SITUATIONS = {
+    "여러 물체가 하나로 붙어 있어요": "merged",
+    "한 물체가 여러 조각으로 쪼개졌어요": "split",
+    "배경이나 바닥 무늬까지 물체로 잡혀요": "too_much",
+    "물체가 덜 잡혀요 (빠지거나 일부만 잡힘)": "too_little",
+    "작은 잡티가 객체로 세어져요": "specks",
+    "얇은 물체가 사라졌어요": "thin_lost",
+}
+
+
+def _clip(key, value, lo, hi):
+    st.session_state[key] = type(DEFAULTS[key])(min(hi, max(lo, value)))
+
+
+def adjust(kind):
+    ss, before = st.session_state, dict(st.session_state)
+    if kind == "merged":
+        _clip("open_k", ss["open_k"] + 4, 0, 51)
+        _clip("close_k", ss["close_k"] - 4, 0, 51)
+        ss["do_split"] = True
+        _clip("solidity_th", round(ss["solidity_th"] + 0.03, 2), 0.5, 1.0)
+        _clip("min_dist", ss["min_dist"] - 3, 3, 100)
+    elif kind == "split":
+        _clip("close_k", ss["close_k"] + 4, 0, 51)
+        _clip("solidity_th", round(ss["solidity_th"] - 0.03, 2), 0.5, 1.0)
+        _clip("min_dist", ss["min_dist"] + 5, 3, 100)
+    elif kind == "too_much":
+        if ss["th_mode"] == "자동":
+            _clip("th_scale", round(ss["th_scale"] + 0.15, 2), 0.3, 2.0)
+        else:
+            _clip("th_val", ss["th_val"] + 5, 0, 255)
+        if ss["denoise"] == "Median":
+            _clip("med_k", ss["med_k"] + 2, 1, 21)
+    elif kind == "too_little":
+        if ss["th_mode"] == "자동":
+            _clip("th_scale", round(ss["th_scale"] - 0.15, 2), 0.3, 2.0)
+        else:
+            _clip("th_val", ss["th_val"] - 5, 0, 255)
+        _clip("close_k", ss["close_k"] + 2, 0, 51)
+    elif kind == "specks":
+        _clip("min_pct", round(ss["min_pct"] + 0.05, 2), 0.0, 2.0)
+        _clip("open_k", ss["open_k"] + 2, 0, 51)
+    elif kind == "thin_lost":
+        _clip("open_k", ss["open_k"] - 2, 0, 51)
+        _clip("min_pct", round(ss["min_pct"] / 2, 2), 0.0, 2.0)
+    names = {"open_k": "Opening", "close_k": "Closing", "do_split": "분리", "solidity_th": "분리 기준",
+             "min_dist": "중심 간격", "th_scale": "임계값 배율", "th_val": "임계값", "med_k": "Median 크기",
+             "min_pct": "최소 면적"}
+    changed = [f"{names[k]} {before.get(k)} → {ss[k]}" for k in names if before.get(k) != ss.get(k)]
+    ss["last_change"] = ", ".join(changed) if changed else "더 조정할 수 있는 값이 없어요 (이미 한계값이에요)."
+
+
+cols = st.columns(3)
+for i, (label, kind) in enumerate(SITUATIONS.items()):
+    cols[i % 3].button(label, on_click=adjust, args=(kind,), use_container_width=True)
+if kind_msg := st.session_state.get("last_change"):
+    st.info(f"**조정됨** {kind_msg}")
+st.caption("배경·무늬까지 잡히면 먼저 사이드바 3번의 **물체가 배경보다…** 방향이 맞는지 확인하세요. "
+           "물체가 빽빽한 사진이면 **배경 보정**을 끄는 것도 방법이에요.")
+st.button("처음 값으로 되돌리기", on_click=apply_preset)
 
 # 5. 최대 / 최소 컴포넌트
 st.subheader("5. 가장 큰 / 가장 작은 component")
