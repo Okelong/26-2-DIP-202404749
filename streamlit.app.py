@@ -170,7 +170,8 @@ if th_mode == "자동":
     # [변경] 배경 보정 영상은 0 근처에 큰 봉우리 + 긴 꼬리 모양이라 Otsu(봉우리 2개 가정)는 너무 높게 잡음
     #        → 이런 분포에 강한 Li 방법 사용. 배경 보정을 끄면 기존 Otsu
     if bg_corr:
-        th_val = int(filters.threshold_li(f_th) * th_scale)
+        from skimage.filters import threshold_li
+        th_val = int(threshold_li(f_th) * th_scale)
         st.sidebar.success(f"Li 자동 임계값: {th_val}")
     else:
         th_val = int(otsu(f_th) * th_scale)
