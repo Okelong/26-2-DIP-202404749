@@ -14,16 +14,18 @@ st.set_page_config(page_title="Object Counting", layout="wide")
 # =====================================================================
 DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
                 direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0, bg_margin=20,
+                tophat=False, tophat_k=51,
                 close_k=5, fill=True, open_k=5, erode_mode="끄기", erode_k=21,
                 min_pct=0.05, connectivity="8-연결", area_est=False)
 
 QUESTIONS = {
     "q_bg": ("배경은 어떤 색인가요?", ["밝다 (흰색, 밝은 회색)", "어둡다 (검정, 짙은 회색)"]),
     "q_texture": ("배경에 무늬나 결이 있나요? (바닥 틈, 천 질감 등)", ["없다 (매끈함)", "있다"]),
+    "q_light": ("조명이 고르지 않나요? (한쪽만 햇빛이 비치거나 그림자가 짐)", ["고르다", "고르지 않다"]),
     "q_similar": ("물체 전체가 배경과 거의 같은 색인 것이 섞여 있나요? (흰 종이 위 흰 블록 등)", ["없다", "있다"]),
     "q_small": ("물체 크기는 어떤가요?", ["보통", "아주 작다 (점처럼 흩어짐)"]),
     "q_touch": ("물체끼리 붙어 있나요?", ["대부분 떨어져 있다", "붙어 있는 곳이 많다"]),
-    "q_same": ("물체들의 크기가 모두 비슷한가요?", ["제각각이다", "거의 같다"]),
+    "q_same": ("물체들의 크기가 모두 비슷한가요? (레고, 면봉 등)", ["제각각이다", "거의 같다"]),
 }
 for k, (_, opts) in QUESTIONS.items():
     st.session_state.setdefault(k, opts[0])
@@ -36,6 +38,7 @@ def apply_answers():
     ss = st.session_state
     bright_bg = ss["q_bg"].startswith("밝")
     texture = ss["q_texture"].startswith("있")
+    uneven = ss["q_light"].startswith("고르지")
     similar = ss["q_similar"].startswith("있")
     small = ss["q_small"].startswith("아주")
     touch = ss["q_touch"].startswith("붙")
@@ -49,6 +52,8 @@ def apply_answers():
         cfg.update(th_mode="직접 지정", th_val=170)
     if texture and not small:
         cfg["med_k"] = 7
+    if uneven:                       # 조명이 고르지 않으면 top-hat으로 배경 밝기 차이를 없앤 뒤 Otsu
+        cfg.update(tophat=True, tophat_k=31 if small else 51, th_mode="Otsu 자동")
     cfg["close_k"] = 3 if (small or touch or texture) else 5
     cfg["open_k"] = 0 if small else (3 if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
@@ -88,7 +93,7 @@ def _set(key, value, lo, hi):
 def adjust(kind):
     ss = st.session_state
     before = {k: ss.get(k) for k in NAMES}
-    more = 1 if ss["direction"].startswith("어둡") else -1   # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향
+    more = 1 if (ss["direction"].startswith("어둡") and not ss["tophat"]) else -1  # 임계값을 '물체가 더 잡히는 쪽'으로
     th_key, lo, hi = {"Otsu 자동": ("th_offset", -60, 60), "직접 지정": ("th_val", 0, 255),
                       "배경 기준 자동": ("bg_margin", 3, 80)}[ss["th_mode"]]
     if ss["th_mode"] == "배경 기준 자동":
@@ -129,12 +134,15 @@ sb = st.sidebar
 sb.title("🔍 Object Counting")
 with sb.expander("📖 사용 방법"):
     st.markdown(
-        "1. **사진 올리기**\n"
-        "2. **사진에 따라 답고르기** \n"
-        "3. **오른쪽 결과를 원본과 비교하기.** \n"
-        "4. **추가보정 : '결과가 이상하면'에서 선택하기.**\n"
-        "5. **세부조정 : 그 외에도 보정하고 싶은 부분이 있으면 '⚙️ 세부 설정'에서 직접 조정하기.**\n"
-        "- **binary mask**: 흰색이 물체로 인식된 부분\n"
+        "1. **사진을 올리세요.**\n"
+        "2. **사진을 보면서 질문에 답하세요.** 답을 고르면 세부 값이 자동으로 정해지고 "
+        "오른쪽 결과가 바로 바뀌어요.\n"
+        "3. **오른쪽 결과를 원본과 비교하세요.** 빠진 물체, 하나로 붙은 물체, 쪼개진 물체가 있는지 보세요.\n"
+        "4. **이상하면 '결과가 이상하면'에서 해당 버튼을 누르세요.** 누를 때마다 값이 한 단계씩 조정돼요.\n\n"
+        "**결과 보는 요령**\n"
+        "- **binary mask**: 흰색이 물체로 인식된 부분이에요.\n"
+        "- **히스토그램의 빨간 선**: 임계값이에요. 선 한쪽이 물체, 반대쪽이 배경이에요.\n"
+        "- 번호 옆 **(x2)**: 붙은 물체를 면적으로 계산해서 2개로 셌다는 뜻이에요."
     )
 
 sb.header("① 사진 올리기")
@@ -169,6 +177,11 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
     elif denoise == "Gaussian":
         sigma = st.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
     cap("바닥 무늬나 잡티가 많이 잡히면 키우세요. 너무 키우면 작은 물체가 뭉개져요.")
+    tophat = st.checkbox("조명 보정 (top-hat)", key="tophat")
+    if tophat:
+        tophat_k = st.slider("조명 보정 크기 (물체보다 크게)", 11, 151, step=2, key="tophat_k")
+    cap("조명이 고르지 않을 때 켜세요. 물체보다 큰 크기로 opening(밝은 물체) 또는 closing(어두운 물체)을 해서 "
+        "배경 밝기를 구하고, 원본과의 차이만 남겨요. 그러면 물체만 밝게 남아요.")
 
     st.markdown("**3. Thresholding**")
     direction = st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
@@ -272,14 +285,27 @@ f = load_gray(uploaded.getvalue(), max_side)
 param = med_k if denoise == "Median" else (sigma if denoise == "Gaussian" else 0)
 f_denoised = do_denoise(f, denoise, param)
 
+# --- 조명 보정 (top-hat) ---
+dark_obj = direction.startswith("어둡")
+if tophat:
+    se = (tophat_k, tophat_k)
+    if dark_obj:   # black-hat: closing(배경) − 영상 → 어두운 물체가 밝게 남음
+        f_th = (nd.grey_closing(f_denoised, size=se).astype(int) - f_denoised).clip(0, 255).astype(np.uint8)
+    else:          # white top-hat: 영상 − opening(배경) → 밝은 물체만 남음
+        f_th = (f_denoised.astype(int) - nd.grey_opening(f_denoised, size=se)).clip(0, 255).astype(np.uint8)
+    obj_is_dark = False   # 보정 영상에서는 물체가 항상 밝음
+else:
+    f_th = f_denoised
+    obj_is_dark = dark_obj
+
 # --- 3. 임계값 ---
 if th_mode == "Otsu 자동":
-    th_val = int(np.clip(otsu(f_denoised) + th_offset, 0, 255))
+    th_val = int(np.clip(otsu(f_th) + th_offset, 0, 255))
 elif th_mode == "배경 기준 자동":
-    bg_level = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))  # 최빈값 = 배경 밝기
-    th_val = int(np.clip(bg_level - bg_margin if direction.startswith("어둡") else bg_level + bg_margin, 0, 255))
+    bg_level = int(np.argmax(np.bincount(f_th.ravel(), minlength=256)))  # 최빈값 = 배경 밝기
+    th_val = int(np.clip(bg_level - bg_margin if obj_is_dark else bg_level + bg_margin, 0, 255))
 
-f_mask = f_denoised < th_val if direction.startswith("어둡") else f_denoised > th_val
+f_mask = f_th < th_val if obj_is_dark else f_th > th_val
 # 순서: closing(조각 잇기) → opening(얇은 연결 끊기) → [erosion] → hole filling
 if close_k > 0:
     f_mask = nd.binary_closing(f_mask, structure=np.ones((close_k, close_k)))
@@ -331,14 +357,18 @@ m3.metric("임계값", th_val, help=f"방식: {th_mode}")
 
 # --- 1~3단계 ---
 st.subheader("1–3. 전처리 & Thresholding")
-c = st.columns(4)
+c = st.columns(5 if tophat else 4)
 with c[0]:
     put(fig_img(f, f"1. input (gray) {f.shape[1]}x{f.shape[0]}"))
 with c[1]:
     put(fig_img(f_denoised, f"2. denoised ({ {'Median': 'median', 'Gaussian': 'gaussian'}.get(denoise, 'none') })"))
+if tophat:
+    with c[2]:
+        put(fig_img(f_th, f"2. {'black-hat' if dark_obj else 'top-hat'} ({tophat_k})"))
+    c = c[1:]
 with c[2]:
     fig, ax = plt.subplots(figsize=(5, 3.6))
-    ax.hist(f_denoised.ravel(), bins=256, range=(0, 256), color="gray")
+    ax.hist(f_th.ravel(), bins=256, range=(0, 256), color="gray")
     ax.axvline(th_val, color="red", linestyle="--", label=f"threshold = {th_val}")
     ax.set_yscale("log")
     ax.set_title("3. histogram")
