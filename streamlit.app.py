@@ -75,18 +75,13 @@ if "answers_applied" not in st.session_state:  # 처음 열었을 때 기본 답
 # ---------------- Sidebar: 파라미터 ----------------
 cap = st.sidebar.caption  # 설명을 물음표 대신 화면에 바로 표시
 
-st.sidebar.header("0. 사진에 대해 알려주세요")
-cap("사진을 보고 아래 질문에 답하면, 1~5번 값이 그 사진에 맞게 **자동으로 설정**돼요. "
-    "보통은 여기만 답하고 결과를 확인하면 돼요.")
-for key, (question, opts) in QUESTIONS.items():
-    st.sidebar.radio(question, opts, key=key, on_change=apply_answers)
+st.sidebar.header("세부 설정")
+cap("가운데 화면의 **사진에 대한 질문**에 답하면 아래 값이 자동으로 정해져요. "
+    "결과가 이상할 때만 직접 바꾸거나, 결과 아래 **지금 상황 고르기** 버튼을 쓰세요.")
 st.sidebar.divider()
-cap("아래 1~5번은 자동으로 정해진 값이에요. 결과가 이상할 때만 직접 바꾸거나, "
-    "결과 아래 **지금 상황 고르기** 버튼을 쓰세요.")
 
 st.sidebar.header("1. 이미지")
 cap("**기능** 사진을 grayscale로 불러오고, 빠른 처리를 위해 긴 변을 정해진 크기로 줄여요.")
-uploaded = st.sidebar.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"])
 max_side = st.sidebar.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
 cap("**언제** 보통은 그대로 두세요. 바꾸면 아래 크기 값들의 의미도 같이 바뀌어요.")
 
@@ -182,11 +177,10 @@ def show(img, cmap="gray", title=None, colorbar=False):
 
 
 # ---------------- 메인 ----------------
-with st.expander("📖 사용 방법 (처음이면 읽어 주세요)", expanded=uploaded is None):
+with st.expander("📖 사용 방법 (처음이면 읽어 주세요)"):
     st.markdown(
-        "1. **왼쪽에서 사진을 올리세요.**\n"
-        "2. **'0. 사진에 대해 알려주세요'의 질문에 답하세요.** 사진을 보고 고르기만 하면 "
-        "나머지 값은 자동으로 정해져요.\n"
+        "1. **사진을 올리세요.**\n"
+        "2. **사진을 보면서 오른쪽 질문에 답하세요.** 답을 고르면 세부 값이 자동으로 정해지고 결과가 바로 바뀌어요.\n"
         "3. **'4. Connected components'에서 결과를 확인하세요.** 물체마다 색과 번호가 붙어요. "
         "원본과 비교해서 빠진 물체, 하나로 붙은 물체, 쪼개진 물체가 있는지 보세요.\n"
         "4. **이상한 곳이 있으면 결과 아래 '지금 상황 고르기'에서 해당 버튼을 누르세요.** "
@@ -197,10 +191,23 @@ with st.expander("📖 사용 방법 (처음이면 읽어 주세요)", expanded=
         "- 번호 옆에 **(x2)**가 붙으면 붙어 있는 물체를 면적으로 계산해서 2개로 센 거예요."
     )
 
+st.subheader("Step 1. 사진 올리기")
+uploaded = st.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"])
 if uploaded is None:
-    st.info("👈 왼쪽 사이드바에서 이미지를 업로드하세요.")
+    st.info("사진을 올리면 사진에 대한 질문이 나와요.")
     st.stop()
 
+st.subheader("Step 2. 사진에 대해 알려주세요")
+st.caption("사진을 보면서 답하세요. 답을 고르는 순간 세부 설정(왼쪽)이 자동으로 바뀌고 아래 결과도 다시 계산돼요.")
+c_img, c_q = st.columns([1, 1])
+with c_img:
+    preview = ImageOps.exif_transpose(Image.open(io.BytesIO(uploaded.getvalue())))
+    st.image(preview, caption="올린 사진")
+with c_q:
+    for key, (question, opts) in QUESTIONS.items():
+        st.radio(question, opts, key=key, on_change=apply_answers, horizontal=True)
+
+st.subheader("Step 3. 결과")
 f = load_gray(uploaded.getvalue(), max_side)
 param = med_k if denoise == "Median" else (sigma if denoise == "Gaussian" else 0)
 with st.spinner("노이즈 제거 중..."):
