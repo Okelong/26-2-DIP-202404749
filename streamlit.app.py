@@ -52,8 +52,10 @@ def answers_to_cfg(ans):
         cfg["direction"] = "둘 다 (|f − 배경| > th)"
     if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고, 윤곽선(edge)도 함께 써서 채움
         cfg.update(th_mode="배경 기준 자동", use_edge=not (same and touch))
-    elif small and not bright_bg:    # 어두운 바닥 위 아주 작은 밝은 물체 → 높게 직접 지정
-        cfg.update(th_mode="직접 지정", th_val=170)
+    elif small and not bright_bg:
+        # 어두운 바닥 위 작은 밝은 물체 → 고정 임계값 대신 top-hat으로 '주변 바닥보다 밝은 정도'를 본 뒤 Otsu
+        # (멀리 있어서 덜 밝게 찍힌 물체도 주변보다는 밝기 때문에 잡힘)
+        uneven = True
     if texture and not small:
         # 질감이 셀수록 median을 크게: 자갈·모래처럼 작은 알갱이는 점(impulse) 노이즈와 비슷해서
         # 평균/Gaussian은 번지게 만들고, median은 지워 줌
@@ -68,6 +70,10 @@ def answers_to_cfg(ans):
     cfg["close_k"] = 3 if (small or touch or texture) else 5
     cfg["open_k"] = 0 if small else (cfg["open_k"] if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
+    obj = st.session_state.get("_obj_size", 0)
+    if small and obj:
+        # 최소 면적을 물체 크기에 맞춤: 대표 물체 면적의 7%보다 작은 덩어리는 잡티로 봄
+        cfg["min_pct"] = float(np.clip(0.07 * obj ** 2 / st.session_state.get("_img_size", 1e6) * 100, 0.002, 0.05))
     if touch and not small and not (similar and same):
         cfg["erode_mode"] = "자동"   # 붙은 물체는 erosion으로 떼어냄 (동전 등)
     cfg["area_est"] = same and touch  # 크기가 같은 물체가 붙어 있으면 면적으로 개수 보정 (레고 등)
@@ -417,6 +423,7 @@ def auto_answers(f):
 
     # 물체 크기(지름) 대략값: 큰 쪽 10% 덩어리 면적의 제곱근 → top-hat 크기를 정할 때 씀
     st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a, 90))) if len(a) else 0.0
+    st.session_state["_img_size"] = float(f.size)
 
     return ans
 
