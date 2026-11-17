@@ -15,6 +15,7 @@ st.set_page_config(page_title="Object Counting", layout="wide")
 DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
                 tophat=False, tophat_k=51,
                 direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0, bg_margin=20,
+                use_edge=False, edge_scale=0.5,
                 close_k=5, fill=True, open_k=5, erode_mode="끄기", erode_k=21,
                 min_pct=0.05, connectivity="8-연결", area_est=False)
 
@@ -45,8 +46,8 @@ def answers_to_cfg(ans):
 
     cfg = dict(DEFAULTS)
     cfg["direction"] = "어둡다 (f < th)" if bright_bg else "밝다 (f > th)"
-    if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고 테두리를 hole filling으로 채움
-        cfg["th_mode"] = "배경 기준 자동"
+    if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고, 윤곽선(edge)도 함께 써서 채움
+        cfg.update(th_mode="배경 기준 자동", use_edge=True)
     elif small and not bright_bg:    # 어두운 바닥 위 아주 작은 밝은 물체 → 높게 직접 지정
         cfg.update(th_mode="직접 지정", th_val=170)
     if texture and not small:
@@ -201,6 +202,14 @@ def process(f, P):
     else:
         th_val = P["th_val"]
     f_mask = f_th < th_val if obj_is_dark else f_th > th_val
+    if P["use_edge"]:
+        # 밝기로는 배경과 구분이 안 되는 물체도 윤곽선은 있음 → Sobel로 윤곽선을 찾고, 닫힌 윤곽 안을 채워서 더함
+        fd = f_denoised.astype(float)
+        grad = np.hypot(nd.sobel(fd, axis=0), nd.sobel(fd, axis=1))
+        grad8 = (grad / max(grad.max(), 1e-6) * 255).astype(np.uint8)
+        edge = grad8 > otsu(grad8) * P["edge_scale"]
+        edge = nd.binary_fill_holes(nd.binary_closing(edge, structure=np.ones((5, 5))))
+        f_mask = f_mask | edge
     # 순서: closing(조각 잇기) → opening(얇은 연결 끊기) → [erosion] → hole filling
     if P["close_k"] > 0:
         f_mask = nd.binary_closing(f_mask, structure=np.ones((P["close_k"], P["close_k"])))
@@ -411,6 +420,11 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
     else:
         st.slider("임계값", 0, 255, key="th_val")
         cap("히스토그램의 빨간 선 위치예요.")
+
+    st.checkbox("윤곽선(edge)도 함께 쓰기", key="use_edge")
+    if st.session_state["use_edge"]:
+        st.slider("윤곽선 민감도 (낮을수록 흐린 윤곽까지)", 0.2, 1.5, step=0.05, key="edge_scale")
+    cap("배경과 색이 거의 같은 물체는 밝기로 안 잡혀요. Sobel로 윤곽선을 찾아서, 닫힌 윤곽 안을 채워 물체에 더해요.")
 
     st.markdown("**4. 모폴로지**")
     st.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k")
