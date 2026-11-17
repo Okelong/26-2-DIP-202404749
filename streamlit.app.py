@@ -61,7 +61,10 @@ def answers_to_cfg(ans):
         cfg["med_k"] = 9 if tex_level > 8 else 7
         cfg["open_k"] = 5 if tex_level > 8 else 3
     if uneven:                       # 조명이 고르지 않으면 top-hat으로 조명 차이를 없앤 뒤 Otsu
-        cfg.update(tophat=True, tophat_k=31 if small else 51, th_mode="Otsu 자동")
+        # top-hat 크기는 물체보다 커야 함(작으면 물체까지 배경으로 지워짐) → 물체 크기의 약 2배
+        obj = st.session_state.get("_obj_size", 0)
+        k = int(np.clip(2 * obj, 31, 151)) | 1 if obj else (31 if small else 51)
+        cfg.update(tophat=True, tophat_k=k, th_mode="Otsu 자동")
     cfg["close_k"] = 3 if (small or touch or texture) else 5
     cfg["open_k"] = 0 if small else (cfg["open_k"] if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
@@ -411,6 +414,10 @@ def auto_answers(f):
             q25, q50, q75 = np.percentile(single, [25, 50, 75])
             same = (q75 - q25) / q50 < 0.3
     ans["q_same"] = QUESTIONS["q_same"][1][int(same)]
+
+    # 물체 크기(지름) 대략값: 큰 쪽 10% 덩어리 면적의 제곱근 → top-hat 크기를 정할 때 씀
+    st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a, 90))) if len(a) else 0.0
+
     return ans
 
 
@@ -429,7 +436,7 @@ def put(fig):
 
 
 # =====================================================================
-# 왼쪽: 조작 (업로드 → 질문 → 상황 고르기 → 세부 설정)
+# 왼쪽: 조작 (업로드 → 상황 고르기 → 세부 설정[사진 분석 결과 포함])
 # =====================================================================
 sb = st.sidebar
 sb.title("🔍 Object Counting")
@@ -458,12 +465,7 @@ if uploaded is not None:
         apply_answers()
         st.session_state["analyzed_file"] = file_id
 
-    sb.header("② 사진에 대해 알려주세요")
-    sb.caption("사진을 분석해서 **자동으로 골라 두었어요.** 실제 사진과 다른 답이 있으면 바꿔 주세요.")
-    for key, (question, opts) in QUESTIONS.items():
-        sb.radio(question, opts, key=key, on_change=apply_answers)
-
-    sb.header("③ 결과가 이상하면")
+    sb.header("② 결과가 이상하면")
     sb.caption("오른쪽 결과를 보고 해당하는 상황을 누르세요. 누를 때마다 한 단계씩 조정돼요.")
     for label, kind in SITUATIONS.items():
         sb.button(label, on_click=adjust, args=(kind,), use_container_width=True)
@@ -474,6 +476,13 @@ if uploaded is not None:
 # 세부 설정: 질문에 답하면 자동으로 정해짐. 직접 바꿀 때만 펼침
 with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
     cap = st.caption
+    st.markdown("**0. 사진 분석 결과**")
+    cap("사진을 올리면 자동으로 분석해서 골라 둬요. 실제 사진과 다른 답이 있으면 바꾸세요. "
+        "바꾸면 아래 1~5번 값이 그 답에 맞게 다시 정해져요.")
+    for key, (question, opts) in QUESTIONS.items():
+        st.radio(question, opts, key=key, on_change=apply_answers)
+    st.divider()
+
     st.markdown("**1. 이미지**")
     st.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
     cap("빠른 처리를 위해 사진을 줄여요. 보통은 그대로 두세요.")
@@ -589,11 +598,11 @@ with c[1]:
 # --- 4단계 ---
 st.subheader(f"4. Connected components — {total}개" + (f" (component {nums}개 + 면적 보정)" if total != nums else ""))
 if nums == 0:
-    st.warning("검출된 객체가 없어요. 왼쪽 질문의 답(특히 배경 색)을 확인해 보세요.")
+    st.warning("검출된 객체가 없어요. 왼쪽 ⚙️ 세부 설정의 '0. 사진 분석 결과'(특히 배경 색)를 확인해 보세요.")
     st.stop()
 if areas.max() > 0.3 * f.size:
     st.warning("하나의 덩어리가 화면의 30% 이상이에요. 여러 물체가 하나로 뭉쳤을 수 있어요 → "
-               "왼쪽 ③에서 **'여러 물체가 하나로 붙어 있어요'**를 눌러 보세요.")
+               "왼쪽 ②에서 **'여러 물체가 하나로 붙어 있어요'**를 눌러 보세요.")
 c1, c2 = st.columns([3, 1])
 with c1:
     colors = np.random.RandomState(0).rand(nums + 1, 3) * 0.8 + 0.2
