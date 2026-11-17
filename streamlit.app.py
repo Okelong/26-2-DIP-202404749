@@ -79,6 +79,9 @@ def answers_to_cfg(ans):
     if touch and not small and not (similar and same):
         cfg["erode_mode"] = "자동"   # 붙은 물체는 erosion으로 떼어냄 (동전 등)
     cfg["area_est"] = same and touch  # 크기가 같은 물체가 붙어 있으면 면적으로 개수 보정 (레고 등)
+    if st.session_state.get("_plain", False):
+        # 자동 분석에서 '배경 빼기 없이 그냥 Otsu'가 훨씬 잘 나눈다고 확인된 사진 (예: 키보드)
+        cfg.update(bg_sub=False, th_mode="Otsu 자동", use_edge=False, area_est=False)
     return cfg
 
 
@@ -344,7 +347,7 @@ def auto_answers(f):
     h, w = fd.shape
     ans = {}
     # 이전에 올린 사진의 분석값이 남아 있으면 판단이 섞이므로, 새 사진 분석 전에 모두 초기화
-    st.session_state.update(_giant=False, _obj_size=0.0, _tex_level=3.0, _img_size=float(f.size))
+    st.session_state.update(_giant=False, _obj_size=0.0, _tex_level=3.0, _img_size=float(f.size), _plain=False)
 
     # 1) 배경 색: 사진 가장자리 픽셀의 중앙값 (가장자리는 대부분 배경)
     b = max(3, min(h, w) // 30)
@@ -455,9 +458,19 @@ def auto_answers(f):
             a_obj = a[a > cut]
     st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a_obj, 90))) if len(a_obj) else 0.0
 
+    # 마지막 확인: 배경 빼기(또는 배경 기준 임계값)를 쓰게 됐는데, 그냥 Otsu로 자른 쪽이 물체를 훨씬 많이
+    # (1.5배 이상) 나누고 거대한 덩어리도 없으면 → 이 사진은 그냥 Otsu가 맞음 (예: 흰 노트북 위 검은 키보드)
+    final = answers_to_cfg(ans)
+    if final["bg_sub"] or final["th_mode"] != "Otsu 자동":
+        r_cur = process(f, final)
+        r_plain = process(f, dict(final, bg_sub=False, th_mode="Otsu 자동", use_edge=False))
+        if (r_plain["nums"] >= 1.5 * max(r_cur["nums"], 1) and r_plain["nums"] >= 5
+                and r_plain["areas"].max() < 0.2 * f.size):
+            st.session_state["_plain"] = True
+
     # 분석 중에 잰 값도 같이 돌려줌. (같은 사진을 다시 올리면 cache 때문에 이 함수가 실행되지 않으므로,
     #  돌려준 값을 session_state에 넣어야 항상 이 사진의 값으로 설정이 정해짐)
-    for key in ["_giant", "_obj_size", "_tex_level", "_img_size"]:
+    for key in ["_giant", "_obj_size", "_tex_level", "_img_size", "_plain"]:
         ans[key] = st.session_state[key]
     return ans
 
