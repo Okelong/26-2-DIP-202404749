@@ -55,11 +55,15 @@ def answers_to_cfg(ans):
     elif small and not bright_bg:    # 어두운 바닥 위 아주 작은 밝은 물체 → 높게 직접 지정
         cfg.update(th_mode="직접 지정", th_val=170)
     if texture and not small:
-        cfg["med_k"] = 7
+        # 질감이 셀수록 median을 크게: 자갈·모래처럼 작은 알갱이는 점(impulse) 노이즈와 비슷해서
+        # 평균/Gaussian은 번지게 만들고, median은 지워 줌
+        tex_level = st.session_state.get("_tex_level", 3.0)
+        cfg["med_k"] = 9 if tex_level > 8 else 7
+        cfg["open_k"] = 5 if tex_level > 8 else 3
     if uneven:                       # 조명이 고르지 않으면 top-hat으로 조명 차이를 없앤 뒤 Otsu
         cfg.update(tophat=True, tophat_k=31 if small else 51, th_mode="Otsu 자동")
     cfg["close_k"] = 3 if (small or touch or texture) else 5
-    cfg["open_k"] = 0 if small else (3 if texture else 5)
+    cfg["open_k"] = 0 if small else (cfg["open_k"] if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
     if touch and not small and not (similar and same):
         cfg["erode_mode"] = "자동"   # 붙은 물체는 erosion으로 떼어냄 (동전 등)
@@ -333,7 +337,8 @@ def auto_answers(f):
     m = nd.uniform_filter(fd.astype(float), 7)
     m2 = nd.uniform_filter(fd.astype(float) ** 2, 7)
     local_std = np.sqrt(np.clip(m2 - m * m, 0, None))
-    texture = np.median(local_std[np.abs(fd.astype(int) - mode) < 20]) > 1.5
+    tex_level = float(np.median(local_std[np.abs(fd.astype(int) - mode) < 20]))
+    texture = tex_level > 1.5
     ans["q_texture"] = QUESTIONS["q_texture"][1][int(texture)]
 
     # 2-1) 밝은 물체와 어두운 물체가 섞임: 밝은 배경인데 배경보다 확실히 더 밝은 덩어리가 2개 이상 있으면
@@ -370,7 +375,16 @@ def auto_answers(f):
     r0 = process(f, P)
     areas = r0["areas"]
     small = len(areas) >= 10 and np.median(areas) < 0.0004 * f.size
+    if small and tex_level > 8:
+        # 자갈·모래처럼 질감이 아주 강하면 바닥 알갱이가 잡티 덩어리로 많이 잡혀서 '물체가 작다'고 착각함
+        # → 덩어리 면적(log)에 Otsu를 써서 '잡티 그룹'과 '물체 그룹'으로 나눈 뒤 물체 그룹 크기로 다시 판단
+        la = np.log(areas.astype(float))
+        q = ((la - la.min()) / max(la.max() - la.min(), 1e-6) * 255).astype(np.uint8)
+        cut = np.exp(la.min() + otsu(q) / 255 * (la.max() - la.min()))
+        objs = areas[areas > cut]
+        small = len(objs) >= 10 and np.median(objs) < 0.0004 * f.size
     ans["q_small"] = QUESTIONS["q_small"][1][int(small)]
+    st.session_state["_tex_level"] = tex_level
     no_touch = QUESTIONS["q_touch"][1][0]
     base = dict(answers_to_cfg(dict(ans, q_touch=no_touch, q_same=QUESTIONS["q_same"][1][0])), use_edge=False)
     r_base = process(f, base)
