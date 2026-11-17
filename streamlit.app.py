@@ -51,9 +51,11 @@ def answers_to_cfg(ans):
     if both:                         # 배경보다 밝은 물체도, 어두운 물체도 있음 → 배경과의 차이 |f − 배경|로 자름
         cfg["direction"] = "둘 다 (|f − 배경| > th)"
     if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고, 윤곽선(edge)도 함께 써서 채움
-        cfg.update(th_mode="배경 기준 자동", use_edge=not (same and touch))
+        # 윤곽선 자르기는 드문드문 붙은 물체용. 크기가 같은 물체(레고)나 빽빽하게 뭉친 물체(동전)는 erosion이 더 정확
+        cfg.update(th_mode="배경 기준 자동",
+                   use_edge=not (same and touch) and not st.session_state.get("_giant", False))
     elif small and not bright_bg:
-        # 어두운 바닥 위 작은 밝은 물체 → 고정 임계값 대신 top-hat으로 '주변 바닥보다 밝은 정도'를 본 뒤 Otsu
+        # 어두운 바닥 위 작은 밝은 물체 → 고정 임계값 대신 배경을 빼서 '주변 바닥보다 밝은 정도'를 본 뒤 Otsu
         # (멀리 있어서 덜 밝게 찍힌 물체도 주변보다는 밝기 때문에 잡힘)
         uneven = True
     if texture and not small:
@@ -62,8 +64,8 @@ def answers_to_cfg(ans):
         tex_level = st.session_state.get("_tex_level", 3.0)
         cfg["med_k"] = 9 if tex_level > 8 else 7
         cfg["open_k"] = 5 if tex_level > 8 else 3
-    if uneven:                       # 조명이 고르지 않으면 top-hat으로 조명 차이를 없앤 뒤 Otsu
-        # top-hat 크기는 물체보다 커야 함(작으면 물체까지 배경으로 지워짐) → 물체 크기의 약 2배
+    if uneven:                       # 조명이 고르지 않으면 배경을 빼서 조명 차이를 없앤 뒤 Otsu
+        # 배경 추정 크기는 물체보다 커야 함(작으면 물체까지 배경으로 지워짐) → 물체 크기의 약 2배
         obj = st.session_state.get("_obj_size", 0)
         k = int(np.clip(2 * obj, 31, 151)) | 1 if obj else (31 if small else 51)
         cfg.update(tophat=True, tophat_k=k, th_mode="Otsu 자동")
@@ -115,7 +117,7 @@ def _set(key, value, lo, hi):
 def adjust(kind):
     ss = st.session_state
     before = {k: ss.get(k) for k in NAMES}
-    # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향 (top-hat 영상에서는 물체가 항상 밝음)
+    # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향 (배경 뺀 영상에서는 물체가 항상 밝음)
     more = 1 if (ss["direction"].startswith("어둡") and not ss["tophat"]) else -1
     th_key, lo, hi = {"Otsu 자동": ("th_offset", -60, 60), "직접 지정": ("th_val", 0, 255),
                       "배경 기준 자동": ("bg_margin", 3, 80)}[ss["th_mode"]]
@@ -182,6 +184,15 @@ def do_denoise(f, mode, param):
     return f
 
 
+def estimate_background(fd, k):
+    """배경 밝기 추정: 물체보다 큰 median filter를 쓰면 물체는 지워지고 바닥(배경) 밝기만 남음.
+    큰 median은 느리므로 1/4로 줄여서 계산한 뒤 원래 크기로 키움"""
+    h, w = fd.shape
+    small = np.array(Image.fromarray(fd).resize((max(1, w // 4), max(1, h // 4)), Image.BILINEAR))
+    bg = nd.median_filter(small, size=max(3, (k // 4) | 1), mode="nearest")
+    return np.array(Image.fromarray(bg).resize((w, h), Image.BILINEAR))
+
+
 def label_cores(mask, ek, fill, structure, min_area):
     """erosion으로 깎은 뒤(ek=0이면 그대로) 구멍 채우고 labeling. 작은 조각은 제외하고 개수 반환"""
     core = nd.binary_erosion(mask, np.ones((ek, ek))) if ek > 0 else mask
@@ -218,7 +229,7 @@ def split_each(labels, min_area, kmax=41):
             out[sl][comp] = nxt; nxt += 1; continue
         lab = best[1]
         for _ in range(best[2] + 2):           # geodesic dilation: 원래 덩어리 안에서만 키움
-            grown = nd.grey_dilation(lab, size=(3, 3))
+            grown = nd.maximum_filter(lab, size=3)   # 이웃 번호로 한 칸씩 넓힘
             lab = np.where((lab == 0) & comp, grown, lab)
         lab[~comp] = 0
         for j in range(1, lab.max() + 1):
@@ -232,24 +243,22 @@ def process(f, P):
     param = P["med_k"] if P["denoise"] == "Median" else (P["sigma"] if P["denoise"] == "Gaussian" else 0)
     f_denoised = do_denoise(f, P["denoise"], param)
 
-    # 조명 보정 (top-hat): 물체보다 큰 크기로 배경 밝기를 구해서 빼면 물체만 남음
+    # 조명 보정 (배경 빼기): 물체보다 큰 median filter로 배경 밝기를 구해서 빼면 조명 차이가 없어지고 물체만 남음
     dark_obj = P["direction"].startswith("어둡")
-    if P["direction"].startswith("둘"):
+    both_dir = P["direction"].startswith("둘")
+    if P["tophat"]:
+        bg = estimate_background(f_denoised, P["tophat_k"]).astype(int)
+        diff = f_denoised.astype(int) - bg
+        if both_dir:
+            diff = np.abs(diff)          # 배경보다 밝든 어둡든 차이가 크면 물체
+        elif dark_obj:
+            diff = -diff                 # 어두운 물체: 배경 − 영상
+        f_th = diff.clip(0, 255).astype(np.uint8)
+        obj_is_dark = False              # 보정 영상에서는 물체가 항상 밝게 남음
+    elif both_dir:
         # 배경 밝기(히스토그램 최빈값)와의 차이: 밝은 물체든 어두운 물체든 배경과 다르면 커짐
-        if P["tophat"]:   # 조명 보정까지: closing(어두운 물체 지운 배경) − opening(밝은 물체 지운 배경)
-            se = (P["tophat_k"], P["tophat_k"])
-            f_th = (nd.grey_closing(f_denoised, size=se).astype(int)
-                    - nd.grey_opening(f_denoised, size=se)).clip(0, 255).astype(np.uint8)
-        else:
-            bg = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))
-            f_th = np.abs(f_denoised.astype(int) - bg).clip(0, 255).astype(np.uint8)
-        obj_is_dark = False
-    elif P["tophat"]:
-        se = (P["tophat_k"], P["tophat_k"])
-        if dark_obj:   # black-hat: closing(배경) − 영상
-            f_th = (nd.grey_closing(f_denoised, size=se).astype(int) - f_denoised).clip(0, 255).astype(np.uint8)
-        else:          # white top-hat: 영상 − opening(배경)
-            f_th = (f_denoised.astype(int) - nd.grey_opening(f_denoised, size=se)).clip(0, 255).astype(np.uint8)
+        bg_level = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))
+        f_th = np.abs(f_denoised.astype(int) - bg_level).clip(0, 255).astype(np.uint8)
         obj_is_dark = False
     else:
         f_th = f_denoised
@@ -296,14 +305,14 @@ def process(f, P):
         keep0 = np.zeros(n + 1, bool)
         keep0[1:] = a >= min_area
         labels = np.where(keep0[labels], labels, 0)
-        labels = nd.grey_dilation(labels, size=(5, 5)) * full             # 잘린 경계선 픽셀을 이웃 번호로 채움
+        labels = nd.maximum_filter(labels, size=5) * full                 # 잘린 경계선 픽셀을 이웃 번호로 채움
         mask_shown = cut
     else:
         labels, core, _ = label_cores(f_mask, ek, P["fill"], structure, min_area)
         if ek > 0:
             # 깎인 부분을 다시 키워서 원래 물체 영역에 번호를 돌려줌 (dilation)
             region = f_mask | nd.binary_dilation(core, np.ones((ek, ek)))
-            labels = nd.grey_dilation(labels, footprint=np.ones((ek + 2, ek + 2))) * region
+            labels = nd.maximum_filter(labels, size=ek + 2) * region
             mask_shown = region
         else:
             mask_shown = core
@@ -334,6 +343,7 @@ def auto_answers(f):
     fd = do_denoise(f, "Median", 5)
     h, w = fd.shape
     ans = {}
+    st.session_state["_giant"] = False
 
     # 1) 배경 색: 사진 가장자리 픽셀의 중앙값 (가장자리는 대부분 배경)
     b = max(3, min(h, w) // 30)
@@ -359,10 +369,15 @@ def auto_answers(f):
         both = (sizes >= 0.0003 * fd.size).sum() >= 2
     ans["q_both"] = QUESTIONS["q_both"][1][int(both)]
 
-    # 3) 조명: 작게 줄인 사진에서 물체를 지운 배경 밝기(closing/opening)의 변화 폭
+    # 3) 조명: 작게 줄인 사진에서 물체를 지운 배경 밝기의 변화 폭
+    #    밝은 배경이면 max filter로 어두운 물체를 지우고(→ min filter로 크기 복원), 어두운 배경이면 그 반대
+    #    (order-statistic filter: 창 안의 최댓값/최솟값으로 바꾸는 필터)
     small_img = np.array(Image.fromarray(fd).resize((max(8, w // 8), max(8, h // 8))))
     k = max(3, min(small_img.shape) // 6)
-    bgmap = nd.grey_closing(small_img, size=(k, k)) if bright_bg else nd.grey_opening(small_img, size=(k, k))
+    if bright_bg:
+        bgmap = nd.minimum_filter(nd.maximum_filter(small_img, size=k), size=k)
+    else:
+        bgmap = nd.maximum_filter(nd.minimum_filter(small_img, size=k), size=k)
     bgmap = nd.uniform_filter(bgmap.astype(float), k)
     uneven = (np.percentile(bgmap, 95) - np.percentile(bgmap, 5)) > 60
     ans["q_light"] = QUESTIONS["q_light"][1][int(uneven)]
@@ -373,7 +388,7 @@ def auto_answers(f):
     if bright_bg and not texture:
         obj_any = (mode - fd.astype(int)) > 12
         obj_otsu = fd < otsu(fd)
-        similar = obj_otsu.sum() / max(1, obj_any.sum()) < 0.75
+        similar = obj_otsu.sum() / max(1, obj_any.sum()) < 0.85
     ans["q_similar"] = QUESTIONS["q_similar"][1][int(similar)]
 
     # 5~7) 물체 크기 / 붙음 / 크기 균일: 위 답으로 한 번 돌려 본 결과(connected component)로 판단
@@ -383,6 +398,12 @@ def auto_answers(f):
     P.update(min_pct=0.004, use_edge=False)    # 작은 물체도 보이게, 윤곽선 자르기 없이 판단
     r0 = process(f, P)
     areas = r0["areas"]
+    # 화면의 20% 넘는 거대한 덩어리 = 빽빽하게 붙은 물체(동전 등)가 하나로 이어진 것
+    # → 이 상태로는 크기를 잴 수 없으니 erosion으로 떼어 본 뒤의 크기로 판단
+    giant = len(areas) > 0 and areas.max() > 0.2 * f.size
+    st.session_state["_giant"] = bool(giant)
+    if giant:
+        areas = process(f, dict(P, erode_mode="자동"))["areas"]
     small = len(areas) >= 10 and np.median(areas) < 0.0004 * f.size
     if small and tex_level > 8:
         # 자갈·모래처럼 질감이 아주 강하면 바닥 알갱이가 잡티 덩어리로 많이 잡혀서 '물체가 작다'고 착각함
@@ -398,8 +419,8 @@ def auto_answers(f):
     base = dict(answers_to_cfg(dict(ans, q_touch=no_touch, q_same=QUESTIONS["q_same"][1][0])), use_edge=False)
     r_base = process(f, base)
     n0, a = r_base["nums"], r_base["areas"]
-    touch = False
-    if not small and n0 > 0:
+    touch = giant
+    if not giant and not small and n0 > 0:
         # erosion으로 떼었을 때 개수가 크게 늘면 = 붙어 있던 물체가 많음
         r_ero = process(f, dict(base, erode_mode="자동"))
         touch = r_ero["nums"] >= 1.3 * n0 and r_ero["nums"] - n0 >= 3
@@ -421,8 +442,16 @@ def auto_answers(f):
             same = (q75 - q25) / q50 < 0.3
     ans["q_same"] = QUESTIONS["q_same"][1][int(same)]
 
-    # 물체 크기(지름) 대략값: 큰 쪽 10% 덩어리 면적의 제곱근 → top-hat 크기를 정할 때 씀
-    st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a, 90))) if len(a) else 0.0
+    # 물체 크기(지름) 대략값: 큰 쪽 10% 덩어리 면적의 제곱근 → 배경 추정 크기를 정할 때 씀
+    # (작은 잡티 그룹은 빼고 계산: 면적(log)에 Otsu를 써서 '물체 그룹'만 사용)
+    a_obj = a
+    if len(a) >= 10:
+        la = np.log(a.astype(float))
+        q = ((la - la.min()) / max(la.max() - la.min(), 1e-6) * 255).astype(np.uint8)
+        cut = np.exp(la.min() + otsu(q) / 255 * (la.max() - la.min()))
+        if (a > cut).sum() >= 5:
+            a_obj = a[a > cut]
+    st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a_obj, 90))) if len(a_obj) else 0.0
     st.session_state["_img_size"] = float(f.size)
 
     return ans
@@ -501,11 +530,11 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
     elif st.session_state["denoise"] == "Gaussian":
         st.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
     cap("바닥 무늬나 잡티가 많이 잡히면 키우세요. 너무 키우면 작은 물체가 뭉개져요.")
-    st.checkbox("조명 보정 (top-hat)", key="tophat")
+    st.checkbox("조명 보정 (배경 빼기)", key="tophat")
     if st.session_state["tophat"]:
-        st.slider("조명 보정 크기 (물체보다 크게)", 11, 151, step=2, key="tophat_k")
-    cap("조명이 고르지 않을 때 켜세요. 물체보다 큰 크기로 opening(밝은 물체) 또는 closing(어두운 물체)을 해서 "
-        "배경 밝기를 구하고, 원본과의 차이만 남겨요.")
+        st.slider("배경 추정 크기 (물체보다 크게)", 11, 151, step=2, key="tophat_k")
+    cap("조명이 고르지 않을 때 켜세요. 물체보다 큰 median filter로 배경 밝기를 구하고, "
+        "원본과의 차이만 남겨요. 그러면 조명 차이는 사라지고 물체만 남아요.")
 
     st.markdown("**3. Thresholding**")
     st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)", "둘 다 (|f − 배경| > th)"], key="direction")
@@ -583,7 +612,7 @@ with c[1]:
     put(fig_img(f_denoised, f"denoised ({ {'Median': 'median', 'Gaussian': 'gaussian'}.get(P['denoise'], 'none') })"))
 if P["tophat"]:
     with c[2]:
-        put(fig_img(f_th, f"{'black-hat' if R['dark_obj'] else 'top-hat'} ({P['tophat_k']})"))
+        put(fig_img(f_th, f"f - background (median {P['tophat_k']})"))
 
 # --- 3단계: thresholding → binary mask ---
 st.subheader("3. Thresholding → Binary mask")
