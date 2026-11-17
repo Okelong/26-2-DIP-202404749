@@ -13,7 +13,7 @@ st.set_page_config(page_title="Object Counting", layout="wide")
 # 기본값 / 사진에 대한 질문 → 세부 값
 # =====================================================================
 DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
-                tophat=False, tophat_k=51,
+                bg_sub=False, bg_k=51,
                 direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0, bg_margin=20,
                 use_edge=False, edge_scale=0.7,
                 close_k=5, fill=True, open_k=5, erode_mode="끄기", erode_k=21,
@@ -68,7 +68,7 @@ def answers_to_cfg(ans):
         # 배경 추정 크기는 물체보다 커야 함(작으면 물체까지 배경으로 지워짐) → 물체 크기의 약 2배
         obj = st.session_state.get("_obj_size", 0)
         k = int(np.clip(2 * obj, 31, 151)) | 1 if obj else (31 if small else 51)
-        cfg.update(tophat=True, tophat_k=k, th_mode="Otsu 자동")
+        cfg.update(bg_sub=True, bg_k=k, th_mode="Otsu 자동")
     cfg["close_k"] = 3 if (small or touch or texture) else 5
     cfg["open_k"] = 0 if small else (cfg["open_k"] if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
@@ -118,7 +118,7 @@ def adjust(kind):
     ss = st.session_state
     before = {k: ss.get(k) for k in NAMES}
     # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향 (배경 뺀 영상에서는 물체가 항상 밝음)
-    more = 1 if (ss["direction"].startswith("어둡") and not ss["tophat"]) else -1
+    more = 1 if (ss["direction"].startswith("어둡") and not ss["bg_sub"]) else -1
     th_key, lo, hi = {"Otsu 자동": ("th_offset", -60, 60), "직접 지정": ("th_val", 0, 255),
                       "배경 기준 자동": ("bg_margin", 3, 80)}[ss["th_mode"]]
     if ss["th_mode"] == "배경 기준 자동":
@@ -246,8 +246,8 @@ def process(f, P):
     # 조명 보정 (배경 빼기): 물체보다 큰 median filter로 배경 밝기를 구해서 빼면 조명 차이가 없어지고 물체만 남음
     dark_obj = P["direction"].startswith("어둡")
     both_dir = P["direction"].startswith("둘")
-    if P["tophat"]:
-        bg = estimate_background(f_denoised, P["tophat_k"]).astype(int)
+    if P["bg_sub"]:
+        bg = estimate_background(f_denoised, P["bg_k"]).astype(int)
         diff = f_denoised.astype(int) - bg
         if both_dir:
             diff = np.abs(diff)          # 배경보다 밝든 어둡든 차이가 크면 물체
@@ -343,7 +343,8 @@ def auto_answers(f):
     fd = do_denoise(f, "Median", 5)
     h, w = fd.shape
     ans = {}
-    st.session_state["_giant"] = False
+    # 이전에 올린 사진의 분석값이 남아 있으면 판단이 섞이므로, 새 사진 분석 전에 모두 초기화
+    st.session_state.update(_giant=False, _obj_size=0.0, _tex_level=3.0, _img_size=float(f.size))
 
     # 1) 배경 색: 사진 가장자리 픽셀의 중앙값 (가장자리는 대부분 배경)
     b = max(3, min(h, w) // 30)
@@ -358,6 +359,7 @@ def auto_answers(f):
     local_std = np.sqrt(np.clip(m2 - m * m, 0, None))
     tex_level = float(np.median(local_std[np.abs(fd.astype(int) - mode) < 20]))
     texture = tex_level > 1.5
+    st.session_state["_tex_level"] = tex_level
     ans["q_texture"] = QUESTIONS["q_texture"][1][int(texture)]
 
     # 2-1) 밝은 물체와 어두운 물체가 섞임: 밝은 배경인데 배경보다 확실히 더 밝은 덩어리가 2개 이상 있으면
@@ -452,8 +454,11 @@ def auto_answers(f):
         if (a > cut).sum() >= 5:
             a_obj = a[a > cut]
     st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a_obj, 90))) if len(a_obj) else 0.0
-    st.session_state["_img_size"] = float(f.size)
 
+    # 분석 중에 잰 값도 같이 돌려줌. (같은 사진을 다시 올리면 cache 때문에 이 함수가 실행되지 않으므로,
+    #  돌려준 값을 session_state에 넣어야 항상 이 사진의 값으로 설정이 정해짐)
+    for key in ["_giant", "_obj_size", "_tex_level", "_img_size"]:
+        ans[key] = st.session_state[key]
     return ans
 
 
@@ -530,9 +535,9 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
     elif st.session_state["denoise"] == "Gaussian":
         st.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
     cap("바닥 무늬나 잡티가 많이 잡히면 키우세요. 너무 키우면 작은 물체가 뭉개져요.")
-    st.checkbox("조명 보정 (배경 빼기)", key="tophat")
-    if st.session_state["tophat"]:
-        st.slider("배경 추정 크기 (물체보다 크게)", 11, 151, step=2, key="tophat_k")
+    st.checkbox("조명 보정 (배경 빼기)", key="bg_sub")
+    if st.session_state["bg_sub"]:
+        st.slider("배경 추정 크기 (물체보다 크게)", 11, 151, step=2, key="bg_k")
     cap("조명이 고르지 않을 때 켜세요. 물체보다 큰 median filter로 배경 밝기를 구하고, "
         "원본과의 차이만 남겨요. 그러면 조명 차이는 사라지고 물체만 남아요.")
 
@@ -604,15 +609,15 @@ with c[0]:
     put(fig_img(f, f"input (grayscale) {f.shape[1]}x{f.shape[0]}"))
 
 # --- 2단계: 노이즈 제거 (+ 조명 보정) ---
-st.subheader("2. 전처리 (노이즈 제거" + (" + 조명 보정)" if P["tophat"] else ")"))
+st.subheader("2. 전처리 (노이즈 제거" + (" + 조명 보정)" if P["bg_sub"] else ")"))
 c = st.columns(3)
 with c[0]:
     put(fig_img(f, "before"))
 with c[1]:
     put(fig_img(f_denoised, f"denoised ({ {'Median': 'median', 'Gaussian': 'gaussian'}.get(P['denoise'], 'none') })"))
-if P["tophat"]:
+if P["bg_sub"]:
     with c[2]:
-        put(fig_img(f_th, f"f - background (median {P['tophat_k']})"))
+        put(fig_img(f_th, f"f - background (median {P['bg_k']})"))
 
 # --- 3단계: thresholding → binary mask ---
 st.subheader("3. Thresholding → Binary mask")
