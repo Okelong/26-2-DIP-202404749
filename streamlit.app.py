@@ -13,6 +13,7 @@ st.set_page_config(page_title="Object Counting", layout="wide")
 # 기본값 / 사진에 대한 질문 → 세부 값
 # =====================================================================
 DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
+                tophat=False, tophat_k=51,
                 direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0, bg_margin=20,
                 close_k=5, fill=True, open_k=5, erode_mode="끄기", erode_k=21,
                 min_pct=0.05, connectivity="8-연결", area_est=False)
@@ -20,6 +21,7 @@ DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
 QUESTIONS = {
     "q_bg": ("배경은 어떤 색인가요?", ["밝다 (흰색, 밝은 회색)", "어둡다 (검정, 짙은 회색)"]),
     "q_texture": ("배경에 무늬나 결이 있나요? (바닥 틈, 천 질감 등)", ["없다 (매끈함)", "있다"]),
+    "q_light": ("조명이 고르지 않나요? (한쪽만 햇빛이 비치거나 그림자가 짐)", ["고르다", "고르지 않다"]),
     "q_similar": ("물체 전체가 배경과 거의 같은 색인 것이 섞여 있나요? (흰 종이 위 흰 블록 등)", ["없다", "있다"]),
     "q_small": ("물체 크기는 어떤가요?", ["보통", "아주 작다 (점처럼 흩어짐)"]),
     "q_touch": ("물체끼리 붙어 있나요?", ["대부분 떨어져 있다", "붙어 있는 곳이 많다"]),
@@ -31,15 +33,15 @@ for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
 
-def apply_answers():
-    """질문 답 → 세부 값. 지금까지 테스트한 사진들(화장품, 은행잎, 레고, 동전)로 정한 규칙"""
-    ss = st.session_state
-    bright_bg = ss["q_bg"].startswith("밝")
-    texture = ss["q_texture"].startswith("있")
-    similar = ss["q_similar"].startswith("있")
-    small = ss["q_small"].startswith("아주")
-    touch = ss["q_touch"].startswith("붙")
-    same = ss["q_same"].startswith("거의")
+def answers_to_cfg(ans):
+    """질문 답 → 세부 값. 테스트한 사진들(화장품, 은행잎, 레고, 동전, 아스팔트)로 정한 규칙"""
+    bright_bg = ans["q_bg"].startswith("밝")
+    texture = ans["q_texture"].startswith("있")
+    uneven = ans["q_light"].startswith("고르지")
+    similar = ans["q_similar"].startswith("있")
+    small = ans["q_small"].startswith("아주")
+    touch = ans["q_touch"].startswith("붙")
+    same = ans["q_same"].startswith("거의")
 
     cfg = dict(DEFAULTS)
     cfg["direction"] = "어둡다 (f < th)" if bright_bg else "밝다 (f > th)"
@@ -49,13 +51,20 @@ def apply_answers():
         cfg.update(th_mode="직접 지정", th_val=170)
     if texture and not small:
         cfg["med_k"] = 7
+    if uneven:                       # 조명이 고르지 않으면 top-hat으로 조명 차이를 없앤 뒤 Otsu
+        cfg.update(tophat=True, tophat_k=31 if small else 51, th_mode="Otsu 자동")
     cfg["close_k"] = 3 if (small or touch or texture) else 5
     cfg["open_k"] = 0 if small else (3 if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
-    if touch and not similar and not small:
+    if touch and not small and not (similar and same):
         cfg["erode_mode"] = "자동"   # 붙은 물체는 erosion으로 떼어냄 (동전 등)
     cfg["area_est"] = same and touch  # 크기가 같은 물체가 붙어 있으면 면적으로 개수 보정 (레고 등)
-    for k, v in cfg.items():
+    return cfg
+
+
+def apply_answers():
+    ss = st.session_state
+    for k, v in answers_to_cfg({k: ss[k] for k in QUESTIONS}).items():
         if k != "max_side":
             ss[k] = v
     ss.pop("last_change", None)
@@ -88,7 +97,8 @@ def _set(key, value, lo, hi):
 def adjust(kind):
     ss = st.session_state
     before = {k: ss.get(k) for k in NAMES}
-    more = 1 if ss["direction"].startswith("어둡") else -1   # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향
+    # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향 (top-hat 영상에서는 물체가 항상 밝음)
+    more = 1 if (ss["direction"].startswith("어둡") and not ss["tophat"]) else -1
     th_key, lo, hi = {"Otsu 자동": ("th_offset", -60, 60), "직접 지정": ("th_val", 0, 255),
                       "배경 기준 자동": ("bg_margin", 3, 80)}[ss["th_mode"]]
     if ss["th_mode"] == "배경 기준 자동":
@@ -120,89 +130,6 @@ def adjust(kind):
         _set("min_pct", round(ss["min_pct"] / 2, 3), 0.0, 1.0)
     changed = [f"{NAMES[k]} {before[k]} → {ss[k]}" for k in NAMES if before[k] != ss.get(k)]
     ss["last_change"] = ", ".join(changed) if changed else "더 조정할 수 있는 값이 없어요."
-
-
-# =====================================================================
-# 왼쪽: 조작 (업로드 → 질문 → 상황 고르기 → 세부 설정)
-# =====================================================================
-sb = st.sidebar
-sb.title("🔍 Object Counting")
-with sb.expander("📖 사용 방법"):
-    st.markdown(
-        "1. **사진 올리기**\n"
-        "2. **사진에 따라 답고르기** \n"
-        "3. **오른쪽 결과를 원본과 비교하기.** \n"
-        "4. **추가보정을 원한다면 '추가보정'에서 선택하기.**\n"
-        "5. **세부조정 : 그 외에도 보정하고 싶은 부분이 있으면 '⚙️ 세부 설정'에서 직접 조정하기.**\n"
-        "- **binary mask**: 흰색이 물체로 인식된 부분\n"
-    )
-
-sb.header("① 사진 올리기")
-uploaded = sb.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
-                            label_visibility="collapsed")
-
-if uploaded is not None:
-    sb.header("② 사진에 대해 알려주세요")
-    sb.caption("답을 고르면 세부 값이 자동으로 정해져요.")
-    for key, (question, opts) in QUESTIONS.items():
-        sb.radio(question, opts, key=key, on_change=apply_answers)
-
-    sb.header("③ 추가보정")
-    sb.caption("결과를 보고 해당하는 상황을 누르세요.")
-    for label, kind in SITUATIONS.items():
-        sb.button(label, on_click=adjust, args=(kind,), use_container_width=True)
-    if msg := st.session_state.get("last_change"):
-        sb.info(f"**조정됨** {msg}")
-    sb.button("↺ 처음 값으로 되돌리기", on_click=apply_answers, use_container_width=True)
-
-# 세부 설정: 질문에 답하면 자동으로 정해짐. 직접 바꿀 때만 펼침
-with sb.expander("⚙️ 세부 설정"):
-    cap = st.caption
-    st.markdown("**1. 이미지**")
-    max_side = st.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
-    cap("빠른 처리를 위해 사진을 줄여요. 보통은 그대로 두세요.")
-
-    st.markdown("**2. 노이즈 제거**")
-    denoise = st.selectbox("필터", ["Median", "Gaussian", "없음"], key="denoise")
-    if denoise == "Median":
-        med_k = st.slider("Median kernel 크기 (홀수)", 1, 21, step=2, key="med_k")
-    elif denoise == "Gaussian":
-        sigma = st.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
-    cap("바닥 무늬나 잡티가 많이 잡히면 키우세요. 너무 키우면 작은 물체가 뭉개져요.")
-
-    st.markdown("**3. Thresholding**")
-    direction = st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
-    th_mode = st.radio("임계값 방식", ["Otsu 자동", "배경 기준 자동", "직접 지정"], key="th_mode")
-    if th_mode == "Otsu 자동":
-        th_offset = st.slider("Otsu 값 보정 (±)", -60, 60, step=1, key="th_offset")
-        cap("Otsu가 구한 값에 더하거나 빼요.")
-    elif th_mode == "배경 기준 자동":
-        bg_margin = st.slider("배경에서 떨어진 정도", 3, 80, step=1, key="bg_margin")
-        cap("히스토그램에서 가장 많은 밝기(= 배경)에서 이만큼 떨어진 곳을 임계값으로 써요. "
-            "작을수록 배경에 가까운 물체까지 잡혀요.")
-    else:
-        th_val = st.slider("임계값", 0, 255, key="th_val")
-        cap("히스토그램의 빨간 선 위치예요.")
-
-    st.markdown("**4. 모폴로지**")
-    close_k = st.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k")
-    cap("한 물체가 여러 조각이면 키우고, 옆 물체와 붙으면 줄이세요.")
-    open_k = st.slider("Opening 크기 (얇은 연결 끊기)", 0, 51, step=2, key="open_k")
-    cap("물체끼리 가늘게 이어져 있으면 키우세요. 가장 얇은 물체보다 크면 그 물체가 사라져요.")
-    fill = st.checkbox("Hole filling (물체 안 구멍 채우기)", key="fill")
-    erode_mode = st.radio("붙은 물체 떼기 (erosion)", ["끄기", "자동", "직접 지정"], horizontal=True,
-                          key="erode_mode")
-    if erode_mode == "직접 지정":
-        erode_k = st.slider("Erosion 크기", 3, 81, step=2, key="erode_k")
-    cap("동전처럼 빽빽하게 붙은 물체를 깎아서 떼어낸 뒤 셉니다. 자동은 물체 수가 가장 많이 나오는 크기를 찾아요. "
-        "켜면 hole filling은 깎은 뒤에 적용돼요 (물체 사이 빈틈이 채워지지 않게).")
-
-    st.markdown("**5. Connected component**")
-    min_pct = st.slider("최소 면적 (영상 대비 %)", 0.0, 1.0, step=0.001, format="%.3f", key="min_pct")
-    cap("작은 잡티가 세어지면 올리고, 작은 물체가 사라지면 내리세요.")
-    connectivity = st.radio("연결성", ["8-연결", "4-연결"], horizontal=True, key="connectivity")
-    area_est = st.checkbox("면적으로 개수 보정 (크기가 같은 물체일 때)", key="area_est")
-    cap("덩어리 픽셀 수 ÷ 물체 1개 픽셀 수(중앙값)로 붙은 물체 개수를 셉니다.")
 
 
 # =====================================================================
@@ -247,6 +174,153 @@ def label_cores(mask, ek, fill, structure, min_area):
     return lab, core, int((areas >= max(1, min_area * 0.2)).sum())
 
 
+def process(f, P):
+    """HW5 과정 2~4단계 + 개수 세기. P는 세부 설정 값(dict)"""
+    param = P["med_k"] if P["denoise"] == "Median" else (P["sigma"] if P["denoise"] == "Gaussian" else 0)
+    f_denoised = do_denoise(f, P["denoise"], param)
+
+    # 조명 보정 (top-hat): 물체보다 큰 크기로 배경 밝기를 구해서 빼면 물체만 남음
+    dark_obj = P["direction"].startswith("어둡")
+    if P["tophat"]:
+        se = (P["tophat_k"], P["tophat_k"])
+        if dark_obj:   # black-hat: closing(배경) − 영상
+            f_th = (nd.grey_closing(f_denoised, size=se).astype(int) - f_denoised).clip(0, 255).astype(np.uint8)
+        else:          # white top-hat: 영상 − opening(배경)
+            f_th = (f_denoised.astype(int) - nd.grey_opening(f_denoised, size=se)).clip(0, 255).astype(np.uint8)
+        obj_is_dark = False
+    else:
+        f_th = f_denoised
+        obj_is_dark = dark_obj
+
+    # 3. 임계값 → binary mask
+    if P["th_mode"] == "Otsu 자동":
+        th_val = int(np.clip(otsu(f_th) + P["th_offset"], 0, 255))
+    elif P["th_mode"] == "배경 기준 자동":
+        bg_level = int(np.argmax(np.bincount(f_th.ravel(), minlength=256)))  # 최빈값 = 배경 밝기
+        th_val = int(np.clip(bg_level - P["bg_margin"] if obj_is_dark else bg_level + P["bg_margin"], 0, 255))
+    else:
+        th_val = P["th_val"]
+    f_mask = f_th < th_val if obj_is_dark else f_th > th_val
+    # 순서: closing(조각 잇기) → opening(얇은 연결 끊기) → [erosion] → hole filling
+    if P["close_k"] > 0:
+        f_mask = nd.binary_closing(f_mask, structure=np.ones((P["close_k"], P["close_k"])))
+    if P["open_k"] > 0:
+        f_mask = nd.binary_opening(f_mask, structure=np.ones((P["open_k"], P["open_k"])))
+
+    # 4. Connected components (+ 붙은 물체 떼기)
+    structure = None if P["connectivity"] == "4-연결" else np.ones((3, 3))
+    min_area = int(P["min_pct"] / 100 * f.size)
+    ek = 0
+    if P["erode_mode"] == "자동":
+        # erosion 크기를 바꿔 가며 물체 수가 가장 많이 나오는 크기를 고름
+        counts = [(k, label_cores(f_mask, k, P["fill"], structure, min_area)[2]) for k in range(3, 82, 4)]
+        best = max(c for _, c in counts)
+        ek = next(k for k, c in counts if c >= 0.97 * best)
+    elif P["erode_mode"] == "직접 지정":
+        ek = P["erode_k"]
+    labels, core, _ = label_cores(f_mask, ek, P["fill"], structure, min_area)
+    if ek > 0:
+        # 깎인 부분을 다시 키워서 원래 물체 영역에 번호를 돌려줌 (dilation)
+        region = f_mask | nd.binary_dilation(core, np.ones((ek, ek)))
+        labels = nd.grey_dilation(labels, footprint=np.ones((ek + 2, ek + 2))) * region
+        mask_shown = region
+    else:
+        mask_shown = core
+    nums = int(labels.max())
+
+    # 작은 조각 제거 후 번호 다시 매기기
+    areas = np.bincount(labels.ravel(), minlength=nums + 1)[1:]
+    keep = areas >= min_area
+    lut = np.zeros(nums + 1, dtype=labels.dtype)
+    lut[1:][keep] = np.arange(1, keep.sum() + 1)
+    labels = lut[labels]
+    areas = areas[keep]
+    nums = int(keep.sum())
+
+    if P["area_est"] and nums > 0:
+        est = np.maximum(1, np.round(areas / np.median(areas))).astype(int)
+    else:
+        est = np.ones(nums, dtype=int)
+    return dict(f_denoised=f_denoised, f_th=f_th, dark_obj=dark_obj, th_val=th_val, mask_shown=mask_shown,
+                ek=ek, labels=labels, areas=areas, nums=nums, est=est, total=int(est.sum()))
+
+
+@st.cache_data(show_spinner=False)
+def auto_answers(f):
+    """사진을 분석해서 7개 질문의 답을 자동으로 고름 (히스토그램, 국소 표준편차, 모폴로지, connected component만 사용)"""
+    fd = do_denoise(f, "Median", 5)
+    h, w = fd.shape
+    ans = {}
+
+    # 1) 배경 색: 사진 가장자리 픽셀의 중앙값 (가장자리는 대부분 배경)
+    b = max(3, min(h, w) // 30)
+    border = np.concatenate([fd[:b].ravel(), fd[-b:].ravel(), fd[:, :b].ravel(), fd[:, -b:].ravel()])
+    bright_bg = np.median(border) > 128
+    ans["q_bg"] = QUESTIONS["q_bg"][1][0 if bright_bg else 1]
+
+    # 2) 배경 무늬: 배경 밝기(히스토그램 최빈값) 근처 픽셀들의 국소 표준편차(7x7)
+    mode = int(np.argmax(np.bincount(fd.ravel(), minlength=256)))
+    m = nd.uniform_filter(fd.astype(float), 7)
+    m2 = nd.uniform_filter(fd.astype(float) ** 2, 7)
+    local_std = np.sqrt(np.clip(m2 - m * m, 0, None))
+    texture = np.median(local_std[np.abs(fd.astype(int) - mode) < 20]) > 1.5
+    ans["q_texture"] = QUESTIONS["q_texture"][1][int(texture)]
+
+    # 3) 조명: 작게 줄인 사진에서 물체를 지운 배경 밝기(closing/opening)의 변화 폭
+    small_img = np.array(Image.fromarray(fd).resize((max(8, w // 8), max(8, h // 8))))
+    k = max(3, min(small_img.shape) // 6)
+    bgmap = nd.grey_closing(small_img, size=(k, k)) if bright_bg else nd.grey_opening(small_img, size=(k, k))
+    bgmap = nd.uniform_filter(bgmap.astype(float), k)
+    uneven = (np.percentile(bgmap, 95) - np.percentile(bgmap, 5)) > 60
+    ans["q_light"] = QUESTIONS["q_light"][1][int(uneven)]
+
+    # 4) 배경과 비슷한 물체: 배경에서 조금이라도 다른 픽셀 중 Otsu가 물체로 잡는 비율이 낮으면
+    #    (= 배경과 비슷한 밝기의 물체 픽셀이 많으면) '있다'
+    similar = False
+    if bright_bg and not texture:
+        obj_any = (mode - fd.astype(int)) > 12
+        obj_otsu = fd < otsu(fd)
+        similar = obj_otsu.sum() / max(1, obj_any.sum()) < 0.75
+    ans["q_similar"] = QUESTIONS["q_similar"][1][int(similar)]
+
+    # 5~7) 물체 크기 / 붙음 / 크기 균일: 위 답으로 한 번 돌려 본 결과(connected component)로 판단
+    probe = dict(ans, q_small=QUESTIONS["q_small"][1][0], q_touch=QUESTIONS["q_touch"][1][0],
+                 q_same=QUESTIONS["q_same"][1][0])
+    P = answers_to_cfg(probe)
+    P["min_pct"] = 0.004                       # 작은 물체도 보이게
+    r0 = process(f, P)
+    areas = r0["areas"]
+    small = len(areas) >= 10 and np.median(areas) < 0.0004 * f.size
+    ans["q_small"] = QUESTIONS["q_small"][1][int(small)]
+    no_touch = QUESTIONS["q_touch"][1][0]
+    base = answers_to_cfg(dict(ans, q_touch=no_touch, q_same=QUESTIONS["q_same"][1][0]))
+    r_base = process(f, base)
+    n0, a = r_base["nums"], r_base["areas"]
+    touch = False
+    if not small and n0 > 0:
+        # erosion으로 떼었을 때 개수가 크게 늘면 = 붙어 있던 물체가 많음
+        r_ero = process(f, dict(base, erode_mode="자동"))
+        touch = r_ero["nums"] >= 1.3 * n0 and r_ero["nums"] - n0 >= 3
+        if touch:
+            a = r_ero["areas"]          # 떼어낸 뒤의 크기로 균일한지 판단
+        # 보통 크기의 4배가 넘는 덩어리가 있고, 큰 덩어리가 여럿이면 역시 붙어 있는 것
+        elif len(a) >= 3:
+            med = np.median(a)
+            touch = a.max() > 4 * med and (a > 1.6 * med).sum() >= 2
+    ans["q_touch"] = QUESTIONS["q_touch"][1][int(touch)]
+
+    # 7) 크기 균일: 낱개로 보이는 덩어리들의 사분위 범위(IQR)가 중앙값의 30%보다 좁으면 '거의 같다'
+    same = False
+    if len(a) >= 5:
+        med = np.median(a)
+        single = a[a < 1.6 * med]          # 붙어서 커진 덩어리는 빼고
+        if len(single) >= 5:
+            q25, q50, q75 = np.percentile(single, [25, 50, 75])
+            same = (q75 - q25) / q50 < 0.3
+    ans["q_same"] = QUESTIONS["q_same"][1][int(same)]
+    return ans
+
+
 def fig_img(img, title, cmap="gray"):
     fig, ax = plt.subplots(figsize=(5, 5 * img.shape[0] / img.shape[1]))
     ax.imshow(img, cmap=cmap, interpolation="nearest")
@@ -262,72 +336,121 @@ def put(fig):
 
 
 # =====================================================================
+# 왼쪽: 조작 (업로드 → 질문 → 상황 고르기 → 세부 설정)
+# =====================================================================
+sb = st.sidebar
+sb.title("🔍 Object Counting")
+with sb.expander("📖 사용 방법"):
+    st.markdown(
+        "1. **사진 올리기**\n"
+        "2. **사진에 따라 답고르기** \n"
+        "3. **오른쪽 결과를 원본과 비교하기.** \n"
+        "4. **추가보정 : '결과가 이상하면'에서 선택하기.**\n"
+        "5. **세부조정 : 그 외에도 보정하고 싶은 부분이 있으면 '⚙️ 세부 설정'에서 직접 조정하기.**\n"
+        "- **binary mask**: 흰색이 물체로 인식된 부분\n"
+    )
+
+sb.header("① 사진 올리기")
+uploaded = sb.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+                            label_visibility="collapsed")
+
+if uploaded is not None:
+    # 새 사진이 올라오면 자동 분석해서 질문 답과 세부 값을 한 번에 정함
+    file_id = (uploaded.name, uploaded.size)
+    if st.session_state.get("analyzed_file") != file_id:
+        with st.spinner("사진을 분석해서 설정을 자동으로 고르는 중..."):
+            auto = auto_answers(load_gray(uploaded.getvalue(), st.session_state["max_side"]))
+        for k, v in auto.items():
+            st.session_state[k] = v
+        apply_answers()
+        st.session_state["analyzed_file"] = file_id
+
+    sb.header("② 사진에 대해 알려주세요")
+    sb.caption("사진을 분석해서 **자동으로 골라 두었어요.** 실제 사진과 다른 답이 있으면 바꿔 주세요.")
+    for key, (question, opts) in QUESTIONS.items():
+        sb.radio(question, opts, key=key, on_change=apply_answers)
+
+    sb.header("③ 결과가 이상하면")
+    sb.caption("오른쪽 결과를 보고 해당하는 상황을 누르세요. 누를 때마다 한 단계씩 조정돼요.")
+    for label, kind in SITUATIONS.items():
+        sb.button(label, on_click=adjust, args=(kind,), use_container_width=True)
+    if msg := st.session_state.get("last_change"):
+        sb.info(f"**조정됨** {msg}")
+    sb.button("↺ 처음 값으로 되돌리기", on_click=apply_answers, use_container_width=True)
+
+# 세부 설정: 질문에 답하면 자동으로 정해짐. 직접 바꿀 때만 펼침
+with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
+    cap = st.caption
+    st.markdown("**1. 이미지**")
+    st.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
+    cap("빠른 처리를 위해 사진을 줄여요. 보통은 그대로 두세요.")
+
+    st.markdown("**2. 노이즈 제거**")
+    st.selectbox("필터", ["Median", "Gaussian", "없음"], key="denoise")
+    if st.session_state["denoise"] == "Median":
+        st.slider("Median kernel 크기 (홀수)", 1, 21, step=2, key="med_k")
+    elif st.session_state["denoise"] == "Gaussian":
+        st.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
+    cap("바닥 무늬나 잡티가 많이 잡히면 키우세요. 너무 키우면 작은 물체가 뭉개져요.")
+    st.checkbox("조명 보정 (top-hat)", key="tophat")
+    if st.session_state["tophat"]:
+        st.slider("조명 보정 크기 (물체보다 크게)", 11, 151, step=2, key="tophat_k")
+    cap("조명이 고르지 않을 때 켜세요. 물체보다 큰 크기로 opening(밝은 물체) 또는 closing(어두운 물체)을 해서 "
+        "배경 밝기를 구하고, 원본과의 차이만 남겨요.")
+
+    st.markdown("**3. Thresholding**")
+    st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
+    st.radio("임계값 방식", ["Otsu 자동", "배경 기준 자동", "직접 지정"], key="th_mode")
+    if st.session_state["th_mode"] == "Otsu 자동":
+        st.slider("Otsu 값 보정 (±)", -60, 60, step=1, key="th_offset")
+        cap("Otsu가 구한 값에 더하거나 빼요.")
+    elif st.session_state["th_mode"] == "배경 기준 자동":
+        st.slider("배경에서 떨어진 정도", 3, 80, step=1, key="bg_margin")
+        cap("히스토그램에서 가장 많은 밝기(= 배경)에서 이만큼 떨어진 곳을 임계값으로 써요. "
+            "작을수록 배경에 가까운 물체까지 잡혀요.")
+    else:
+        st.slider("임계값", 0, 255, key="th_val")
+        cap("히스토그램의 빨간 선 위치예요.")
+
+    st.markdown("**4. 모폴로지**")
+    st.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k")
+    cap("한 물체가 여러 조각이면 키우고, 옆 물체와 붙으면 줄이세요.")
+    st.slider("Opening 크기 (얇은 연결 끊기)", 0, 51, step=2, key="open_k")
+    cap("물체끼리 가늘게 이어져 있으면 키우세요. 가장 얇은 물체보다 크면 그 물체가 사라져요.")
+    st.checkbox("Hole filling (물체 안 구멍 채우기)", key="fill")
+    st.radio("붙은 물체 떼기 (erosion)", ["끄기", "자동", "직접 지정"], horizontal=True, key="erode_mode")
+    if st.session_state["erode_mode"] == "직접 지정":
+        st.slider("Erosion 크기", 3, 81, step=2, key="erode_k")
+    cap("동전처럼 빽빽하게 붙은 물체를 깎아서 떼어낸 뒤 셉니다. 자동은 물체 수가 가장 많이 나오는 크기를 찾아요. "
+        "켜면 hole filling은 깎은 뒤에 적용돼요 (물체 사이 빈틈이 채워지지 않게).")
+
+    st.markdown("**5. Connected component**")
+    st.slider("최소 면적 (영상 대비 %)", 0.0, 1.0, step=0.001, format="%.3f", key="min_pct")
+    cap("작은 잡티가 세어지면 올리고, 작은 물체가 사라지면 내리세요.")
+    st.radio("연결성", ["8-연결", "4-연결"], horizontal=True, key="connectivity")
+    st.checkbox("면적으로 개수 보정 (크기가 같은 물체일 때)", key="area_est")
+    cap("덩어리 픽셀 수 ÷ 물체 1개 픽셀 수(중앙값)로 붙은 물체 개수를 셉니다.")
+
+
+# =====================================================================
 # 오른쪽: 각 과정의 결과만
 # =====================================================================
 if uploaded is None:
     st.info("👈 왼쪽에서 사진을 올리세요.")
     st.stop()
 
-f = load_gray(uploaded.getvalue(), max_side)
-param = med_k if denoise == "Median" else (sigma if denoise == "Gaussian" else 0)
-f_denoised = do_denoise(f, denoise, param)
-
-# --- 3. 임계값 ---
-if th_mode == "Otsu 자동":
-    th_val = int(np.clip(otsu(f_denoised) + th_offset, 0, 255))
-elif th_mode == "배경 기준 자동":
-    bg_level = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))  # 최빈값 = 배경 밝기
-    th_val = int(np.clip(bg_level - bg_margin if direction.startswith("어둡") else bg_level + bg_margin, 0, 255))
-
-f_mask = f_denoised < th_val if direction.startswith("어둡") else f_denoised > th_val
-# 순서: closing(조각 잇기) → opening(얇은 연결 끊기) → [erosion] → hole filling
-if close_k > 0:
-    f_mask = nd.binary_closing(f_mask, structure=np.ones((close_k, close_k)))
-if open_k > 0:
-    f_mask = nd.binary_opening(f_mask, structure=np.ones((open_k, open_k)))
-
-# --- 4. Connected components ---
-structure = None if connectivity == "4-연결" else np.ones((3, 3))
-min_area = int(min_pct / 100 * f.size)
-ek = 0
-if erode_mode == "자동":
-    # erosion 크기를 바꿔 가며 물체 수가 가장 많이 나오는 크기를 고름
-    counts = [(k, label_cores(f_mask, k, fill, structure, min_area)[2]) for k in range(3, 82, 4)]
-    best = max(c for _, c in counts)
-    ek = next(k for k, c in counts if c >= 0.97 * best)
-elif erode_mode == "직접 지정":
-    ek = erode_k
-labels, core, _ = label_cores(f_mask, ek, fill, structure, min_area)
-if ek > 0:
-    # 깎인 부분을 다시 키워서 원래 물체 영역에 번호를 돌려줌 (dilation)
-    region = f_mask | nd.binary_dilation(core, np.ones((ek, ek)))
-    labels = nd.grey_dilation(labels, footprint=np.ones((ek + 2, ek + 2))) * region
-    mask_shown = region
-else:
-    mask_shown = core
-nums = int(labels.max())
-
-# 작은 조각 제거 후 번호 다시 매기기
-areas = np.bincount(labels.ravel(), minlength=nums + 1)[1:]
-keep = areas >= min_area
-lut = np.zeros(nums + 1, dtype=labels.dtype)
-lut[1:][keep] = np.arange(1, keep.sum() + 1)
-labels = lut[labels]
-areas = areas[keep]
-nums = int(keep.sum())
+P = {k: st.session_state[k] for k in DEFAULTS}
+f = load_gray(uploaded.getvalue(), P["max_side"])
+R = process(f, P)
+f_denoised, f_th, th_val, ek = R["f_denoised"], R["f_th"], R["th_val"], R["ek"]
+labels, areas, nums, est, total = R["labels"], R["areas"], R["nums"], R["est"], R["total"]
 idx = np.arange(1, nums + 1)
-
-if area_est and nums > 0:
-    est = np.maximum(1, np.round(areas / np.median(areas))).astype(int)
-else:
-    est = np.ones(nums, dtype=int)
-total = int(est.sum())
 
 # --- 화면: 요약 ---
 m1, m2, m3 = st.columns(3)
 m1.metric("검출된 객체 수", total)
 m2.metric("Connected component 수", nums)
-m3.metric("임계값", th_val, help=f"방식: {th_mode}")
+m3.metric("임계값", th_val, help=f"방식: {P['th_mode']}")
 
 # --- 1단계: grayscale 불러오기 ---
 st.subheader("1. Grayscale 영상 불러오기")
@@ -335,20 +458,23 @@ c = st.columns(3)
 with c[0]:
     put(fig_img(f, f"input (grayscale) {f.shape[1]}x{f.shape[0]}"))
 
-# --- 2단계: 노이즈 제거 ---
-st.subheader("2. 전처리 (노이즈 제거)")
+# --- 2단계: 노이즈 제거 (+ 조명 보정) ---
+st.subheader("2. 전처리 (노이즈 제거" + (" + 조명 보정)" if P["tophat"] else ")"))
 c = st.columns(3)
 with c[0]:
     put(fig_img(f, "before"))
 with c[1]:
-    put(fig_img(f_denoised, f"denoised ({ {'Median': 'median', 'Gaussian': 'gaussian'}.get(denoise, 'none') })"))
+    put(fig_img(f_denoised, f"denoised ({ {'Median': 'median', 'Gaussian': 'gaussian'}.get(P['denoise'], 'none') })"))
+if P["tophat"]:
+    with c[2]:
+        put(fig_img(f_th, f"{'black-hat' if R['dark_obj'] else 'top-hat'} ({P['tophat_k']})"))
 
 # --- 3단계: thresholding → binary mask ---
 st.subheader("3. Thresholding → Binary mask")
 c = st.columns(3)
 with c[0]:
     fig, ax = plt.subplots(figsize=(5, 3.6))
-    ax.hist(f_denoised.ravel(), bins=256, range=(0, 256), color="gray")
+    ax.hist(f_th.ravel(), bins=256, range=(0, 256), color="gray")
     ax.axvline(th_val, color="red", linestyle="--", label=f"threshold = {th_val}")
     ax.set_yscale("log")
     ax.set_title("histogram")
@@ -357,7 +483,7 @@ with c[0]:
     fig.tight_layout()
     put(fig)
 with c[1]:
-    put(fig_img(mask_shown, "binary mask" + (f" (erosion {ek})" if ek else "")))
+    put(fig_img(R["mask_shown"], "binary mask" + (f" (erosion {ek})" if ek else "")))
 
 # --- 4단계 ---
 st.subheader(f"4. Connected components — {total}개" + (f" (component {nums}개 + 면적 보정)" if total != nums else ""))
@@ -384,7 +510,7 @@ with c1:
     put(fig)
 with c2:
     cc = pd.DataFrame({"index": idx, "number of pixels": areas})
-    if area_est:
+    if P["area_est"]:
         cc["추정 개수"] = est
     st.dataframe(cc, hide_index=True, use_container_width=True, height=480)
     st.download_button("CSV 다운로드", cc.to_csv(index=False).encode("utf-8-sig"), "components.csv", "text/csv")
