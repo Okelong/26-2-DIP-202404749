@@ -2,6 +2,7 @@ import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors  # 컬러맵 에러 수정을 위해 추가
 import scipy.signal as signal
 import scipy.ndimage as nd
 from PIL import Image, ImageOps
@@ -50,37 +51,36 @@ def answers_to_cfg(ans):
     cfg["direction"] = "어둡다 (f < th)" if bright_bg else "밝다 (f > th)"
     if both:                         # 배경보다 밝은 물체도, 어두운 물체도 있음 → 배경과의 차이 |f − 배경|로 자름
         cfg["direction"] = "둘 다 (|f − 배경| > th)"
+    
     if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고, 윤곽선(edge)도 함께 써서 채움
-        # 윤곽선 자르기는 드문드문 붙은 물체용. 크기가 같은 물체(레고)나 빽빽하게 뭉친 물체(동전)는 erosion이 더 정확
         cfg.update(th_mode="배경 기준 자동",
                    use_edge=not (same and touch) and not st.session_state.get("_giant", False))
     elif small and not bright_bg:
-        # 어두운 바닥 위 작은 밝은 물체 → 고정 임계값 대신 배경을 빼서 '주변 바닥보다 밝은 정도'를 본 뒤 Otsu
-        # (멀리 있어서 덜 밝게 찍힌 물체도 주변보다는 밝기 때문에 잡힘)
         uneven = True
+        
     if texture and not small:
-        # 질감이 셀수록 median을 크게: 자갈·모래처럼 작은 알갱이는 점(impulse) 노이즈와 비슷해서
-        # 평균/Gaussian은 번지게 만들고, median은 지워 줌
         tex_level = st.session_state.get("_tex_level", 3.0)
         cfg["med_k"] = 9 if tex_level > 8 else 7
         cfg["open_k"] = 5 if tex_level > 8 else 3
-    if uneven:                       # 조명이 고르지 않으면 배경을 빼서 조명 차이를 없앤 뒤 Otsu
-        # 배경 추정 크기는 물체보다 커야 함(작으면 물체까지 배경으로 지워짐) → 물체 크기의 약 2배
+        
+    if uneven:                       # 조명 불균일 & 빛 반사 방어 로직 (개선됨)
         obj = st.session_state.get("_obj_size", 0)
-        k = int(np.clip(2 * obj, 31, 151)) | 1 if obj else (31 if small else 51)
-        cfg.update(bg_sub=True, bg_k=k, th_mode="Otsu 자동")
+        # 빛 반사가 심한 중앙부 키보드 등은 Otsu보다 일정 차이값 이상을 객체로 잡는 것이 정확함
+        k = int(np.clip(2.5 * obj, 41, 151)) | 1 if obj else (31 if small else 51)
+        cfg.update(bg_sub=True, bg_k=k, th_mode="배경 기준 자동", bg_margin=20)
+        
     cfg["close_k"] = 3 if (small or touch or texture) else 5
     cfg["open_k"] = 0 if small else (cfg["open_k"] if texture else 5)
     cfg["min_pct"] = 0.004 if small else (0.02 if texture else 0.05)
+    
     obj = st.session_state.get("_obj_size", 0)
     if small and obj:
-        # 최소 면적을 물체 크기에 맞춤: 대표 물체 면적의 7%보다 작은 덩어리는 잡티로 봄
         cfg["min_pct"] = float(np.clip(0.07 * obj ** 2 / st.session_state.get("_img_size", 1e6) * 100, 0.002, 0.05))
     if touch and not small and not (similar and same):
-        cfg["erode_mode"] = "자동"   # 붙은 물체는 erosion으로 떼어냄 (동전 등)
-    cfg["area_est"] = same and touch  # 크기가 같은 물체가 붙어 있으면 면적으로 개수 보정 (레고 등)
+        cfg["erode_mode"] = "자동"   
+    cfg["area_est"] = same and touch 
+    
     if st.session_state.get("_plain", False):
-        # 자동 분석에서 '배경 빼기 없이 그냥 Otsu'가 훨씬 잘 나눈다고 확인된 사진 (예: 키보드)
         cfg.update(bg_sub=False, th_mode="Otsu 자동", use_edge=False, area_est=False)
     return cfg
 
@@ -97,8 +97,9 @@ if "answers_applied" not in st.session_state:
     apply_answers()
     st.session_state["answers_applied"] = True
 
+
 # =====================================================================
-# 지금 상황 고르기: 결과를 보고 버튼을 누르면 관련 값이 한 단계씩 조정됨
+# 지금 상황 고르기
 # =====================================================================
 SITUATIONS = {
     "여러 물체가 하나로 붙어 있어요": "merged",
@@ -120,12 +121,11 @@ def _set(key, value, lo, hi):
 def adjust(kind):
     ss = st.session_state
     before = {k: ss.get(k) for k in NAMES}
-    # 임계값을 '물체가 더 잡히는 쪽'으로 움직이는 방향 (배경 뺀 영상에서는 물체가 항상 밝음)
     more = 1 if (ss["direction"].startswith("어둡") and not ss["bg_sub"]) else -1
     th_key, lo, hi = {"Otsu 자동": ("th_offset", -60, 60), "직접 지정": ("th_val", 0, 255),
                       "배경 기준 자동": ("bg_margin", 3, 80)}[ss["th_mode"]]
     if ss["th_mode"] == "배경 기준 자동":
-        more = -1                                              # 간격을 줄일수록 물체가 더 잡힘
+        more = -1                                              
     if kind == "merged":
         if ss["erode_mode"] == "끄기":
             ss["erode_mode"] = "자동"
@@ -166,13 +166,17 @@ def otsu(img):
     mu_t = mu[-1]
     with np.errstate(divide="ignore", invalid="ignore"):
         sigma_b = (mu_t * omega - mu) ** 2 / (omega * (1 - omega))
+    
+    # 0나누기 방어 (앱 크래시 방지)
+    if np.isnan(sigma_b).all():
+        return 0
     return int(np.nanargmax(sigma_b))
 
 
 @st.cache_data(show_spinner=False)
 def load_gray(file_bytes, max_side):
     I = Image.open(io.BytesIO(file_bytes))
-    I = ImageOps.exif_transpose(I)  # 휴대폰 사진 회전 보정
+    I = ImageOps.exif_transpose(I)  
     I = I.convert("L")
     I.thumbnail((max_side, max_side))
     return np.array(I)
@@ -188,8 +192,6 @@ def do_denoise(f, mode, param):
 
 
 def estimate_background(fd, k):
-    """배경 밝기 추정: 물체보다 큰 median filter를 쓰면 물체는 지워지고 바닥(배경) 밝기만 남음.
-    큰 median은 느리므로 1/4로 줄여서 계산한 뒤 원래 크기로 키움"""
     h, w = fd.shape
     small = np.array(Image.fromarray(fd).resize((max(1, w // 4), max(1, h // 4)), Image.BILINEAR))
     bg = nd.median_filter(small, size=max(3, (k // 4) | 1), mode="nearest")
@@ -197,7 +199,6 @@ def estimate_background(fd, k):
 
 
 def label_cores(mask, ek, fill, structure, min_area):
-    """erosion으로 깎은 뒤(ek=0이면 그대로) 구멍 채우고 labeling. 작은 조각은 제외하고 개수 반환"""
     core = nd.binary_erosion(mask, np.ones((ek, ek))) if ek > 0 else mask
     if fill:
         core = nd.binary_fill_holes(core)
@@ -207,8 +208,6 @@ def label_cores(mask, ek, fill, structure, min_area):
 
 
 def split_each(labels, min_area, kmax=41):
-    """보통보다 큰 덩어리마다 erosion 크기를 따로 골라서(가장 많이 나뉘는 크기) 떼어낸 뒤,
-    원래 덩어리 안에서만 다시 키움(geodesic dilation). 겹친 낙엽처럼 덩어리마다 붙은 정도가 다를 때 씀"""
     out = np.zeros_like(labels); nxt = 1
     areas = np.bincount(labels.ravel())[1:]
     med = np.median(areas) if len(areas) else 0
@@ -231,8 +230,8 @@ def split_each(labels, min_area, kmax=41):
         if best[1] is None:
             out[sl][comp] = nxt; nxt += 1; continue
         lab = best[1]
-        for _ in range(best[2] + 2):           # geodesic dilation: 원래 덩어리 안에서만 키움
-            grown = nd.maximum_filter(lab, size=3)   # 이웃 번호로 한 칸씩 넓힘
+        for _ in range(best[2] + 2):           
+            grown = nd.maximum_filter(lab, size=3)   
             lab = np.where((lab == 0) & comp, grown, lab)
         lab[~comp] = 0
         for j in range(1, lab.max() + 1):
@@ -242,24 +241,21 @@ def split_each(labels, min_area, kmax=41):
 
 
 def process(f, P):
-    """HW5 과정 2~4단계 + 개수 세기. P는 세부 설정 값(dict)"""
     param = P["med_k"] if P["denoise"] == "Median" else (P["sigma"] if P["denoise"] == "Gaussian" else 0)
     f_denoised = do_denoise(f, P["denoise"], param)
 
-    # 조명 보정 (배경 빼기): 물체보다 큰 median filter로 배경 밝기를 구해서 빼면 조명 차이가 없어지고 물체만 남음
     dark_obj = P["direction"].startswith("어둡")
     both_dir = P["direction"].startswith("둘")
     if P["bg_sub"]:
         bg = estimate_background(f_denoised, P["bg_k"]).astype(int)
         diff = f_denoised.astype(int) - bg
         if both_dir:
-            diff = np.abs(diff)          # 배경보다 밝든 어둡든 차이가 크면 물체
+            diff = np.abs(diff)          
         elif dark_obj:
-            diff = -diff                 # 어두운 물체: 배경 − 영상
+            diff = -diff                 
         f_th = diff.clip(0, 255).astype(np.uint8)
-        obj_is_dark = False              # 보정 영상에서는 물체가 항상 밝게 남음
+        obj_is_dark = False              
     elif both_dir:
-        # 배경 밝기(히스토그램 최빈값)와의 차이: 밝은 물체든 어두운 물체든 배경과 다르면 커짐
         bg_level = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))
         f_th = np.abs(f_denoised.astype(int) - bg_level).clip(0, 255).astype(np.uint8)
         obj_is_dark = False
@@ -267,39 +263,36 @@ def process(f, P):
         f_th = f_denoised
         obj_is_dark = dark_obj
 
-    # 3. 임계값 → binary mask
     if P["th_mode"] == "Otsu 자동":
         th_val = int(np.clip(otsu(f_th) + P["th_offset"], 0, 255))
     elif P["th_mode"] == "배경 기준 자동":
-        bg_level = int(np.argmax(np.bincount(f_th.ravel(), minlength=256)))  # 최빈값 = 배경 밝기
+        bg_level = int(np.argmax(np.bincount(f_th.ravel(), minlength=256)))  
         th_val = int(np.clip(bg_level - P["bg_margin"] if obj_is_dark else bg_level + P["bg_margin"], 0, 255))
     else:
         th_val = P["th_val"]
+        
     f_mask = f_th < th_val if obj_is_dark else f_th > th_val
-    # 순서: closing(조각 잇기) → opening(얇은 연결 끊기) → [erosion] → hole filling
+    
     if P["close_k"] > 0:
         f_mask = nd.binary_closing(f_mask, structure=np.ones((P["close_k"], P["close_k"])))
     if P["open_k"] > 0:
         f_mask = nd.binary_opening(f_mask, structure=np.ones((P["open_k"], P["open_k"])))
 
-    # 4. Connected components (+ 붙은 물체 떼기)
     structure = None if P["connectivity"] == "4-연결" else np.ones((3, 3))
     min_area = int(P["min_pct"] / 100 * f.size)
     ek = 0
     if P["erode_mode"] == "자동" and not P["use_edge"]:
-        # erosion 크기를 바꿔 가며 물체 수가 가장 많이 나오는 크기를 고름
         counts = [(k, label_cores(f_mask, k, P["fill"], structure, min_area)[2]) for k in range(3, 82, 4)]
         best = max(c for _, c in counts)
         ek = next(k for k, c in counts if c >= 0.97 * best)
     elif P["erode_mode"] == "직접 지정":
         ek = P["erode_k"]
+        
     if P["use_edge"]:
-        # 마지막 단계에서 Sobel 윤곽선으로 붙은 물체 사이를 잘라냄
-        # (mask를 다 만든 뒤 윤곽선 픽셀을 빼서 경계를 만들고 → labeling → 잘린 선만큼 다시 채움)
         ek = 0
         full = nd.binary_fill_holes(f_mask) if P["fill"] else f_mask
         fd = f_denoised.astype(float)
-        grad = np.hypot(nd.sobel(fd, axis=0), nd.sobel(fd, axis=1))      # gradient 크기 = sqrt(gx² + gy²)
+        grad = np.hypot(nd.sobel(fd, axis=0), nd.sobel(fd, axis=1))      
         grad8 = (grad / max(grad.max(), 1e-6) * 255).astype(np.uint8)
         edge = grad8 > otsu(grad8) * P["edge_scale"]
         cut = full & ~edge
@@ -308,22 +301,20 @@ def process(f, P):
         keep0 = np.zeros(n + 1, bool)
         keep0[1:] = a >= min_area
         labels = np.where(keep0[labels], labels, 0)
-        labels = nd.maximum_filter(labels, size=5) * full                 # 잘린 경계선 픽셀을 이웃 번호로 채움
+        labels = nd.maximum_filter(labels, size=5) * full                 
         mask_shown = cut
     else:
         labels, core, _ = label_cores(f_mask, ek, P["fill"], structure, min_area)
         if ek > 0:
-            # 깎인 부분을 다시 키워서 원래 물체 영역에 번호를 돌려줌 (dilation)
             region = f_mask | nd.binary_dilation(core, np.ones((ek, ek)))
             labels = nd.maximum_filter(labels, size=ek + 2) * region
             mask_shown = region
         else:
             mask_shown = core
         if P["erode_mode"] == "자동":
-            labels = split_each(labels, min_area)   # 전체 erosion으로 안 떨어진 큰 덩어리는 따로 한 번 더
+            labels = split_each(labels, min_area)   
     nums = int(labels.max())
 
-    # 작은 조각 제거 후 번호 다시 매기기
     areas = np.bincount(labels.ravel(), minlength=nums + 1)[1:]
     keep = areas >= min_area
     lut = np.zeros(nums + 1, dtype=labels.dtype)
@@ -342,20 +333,16 @@ def process(f, P):
 
 @st.cache_data(show_spinner=False)
 def auto_answers(f):
-    """사진을 분석해서 7개 질문의 답을 자동으로 고름 (히스토그램, 국소 표준편차, 모폴로지, connected component만 사용)"""
     fd = do_denoise(f, "Median", 5)
     h, w = fd.shape
     ans = {}
-    # 이전에 올린 사진의 분석값이 남아 있으면 판단이 섞이므로, 새 사진 분석 전에 모두 초기화
     st.session_state.update(_giant=False, _obj_size=0.0, _tex_level=3.0, _img_size=float(f.size), _plain=False)
 
-    # 1) 배경 색: 사진 가장자리 픽셀의 중앙값 (가장자리는 대부분 배경)
     b = max(3, min(h, w) // 30)
     border = np.concatenate([fd[:b].ravel(), fd[-b:].ravel(), fd[:, :b].ravel(), fd[:, -b:].ravel()])
     bright_bg = np.median(border) > 128
     ans["q_bg"] = QUESTIONS["q_bg"][1][0 if bright_bg else 1]
 
-    # 2) 배경 무늬: 배경 밝기(히스토그램 최빈값) 근처 픽셀들의 국소 표준편차(7x7)
     mode = int(np.argmax(np.bincount(fd.ravel(), minlength=256)))
     m = nd.uniform_filter(fd.astype(float), 7)
     m2 = nd.uniform_filter(fd.astype(float) ** 2, 7)
@@ -365,7 +352,6 @@ def auto_answers(f):
     st.session_state["_tex_level"] = tex_level
     ans["q_texture"] = QUESTIONS["q_texture"][1][int(texture)]
 
-    # 2-1) 밝은 물체와 어두운 물체가 섞임: 밝은 배경인데 배경보다 확실히 더 밝은 덩어리가 2개 이상 있으면
     both = False
     if bright_bg and mode < 215:
         brighter = nd.binary_opening(fd.astype(int) > mode + 30, structure=np.ones((5, 5)))
@@ -374,9 +360,6 @@ def auto_answers(f):
         both = (sizes >= 0.0003 * fd.size).sum() >= 2
     ans["q_both"] = QUESTIONS["q_both"][1][int(both)]
 
-    # 3) 조명: 작게 줄인 사진에서 물체를 지운 배경 밝기의 변화 폭
-    #    밝은 배경이면 max filter로 어두운 물체를 지우고(→ min filter로 크기 복원), 어두운 배경이면 그 반대
-    #    (order-statistic filter: 창 안의 최댓값/최솟값으로 바꾸는 필터)
     small_img = np.array(Image.fromarray(fd).resize((max(8, w // 8), max(8, h // 8))))
     k = max(3, min(small_img.shape) // 6)
     if bright_bg:
@@ -387,8 +370,6 @@ def auto_answers(f):
     uneven = (np.percentile(bgmap, 95) - np.percentile(bgmap, 5)) > 60
     ans["q_light"] = QUESTIONS["q_light"][1][int(uneven)]
 
-    # 4) 배경과 비슷한 물체: 배경에서 조금이라도 다른 픽셀 중 Otsu가 물체로 잡는 비율이 낮으면
-    #    (= 배경과 비슷한 밝기의 물체 픽셀이 많으면) '있다'
     similar = False
     if bright_bg and not texture:
         obj_any = (mode - fd.astype(int)) > 12
@@ -396,29 +377,26 @@ def auto_answers(f):
         similar = obj_otsu.sum() / max(1, obj_any.sum()) < 0.85
     ans["q_similar"] = QUESTIONS["q_similar"][1][int(similar)]
 
-    # 5~7) 물체 크기 / 붙음 / 크기 균일: 위 답으로 한 번 돌려 본 결과(connected component)로 판단
     probe = dict(ans, q_small=QUESTIONS["q_small"][1][0], q_touch=QUESTIONS["q_touch"][1][0],
                  q_same=QUESTIONS["q_same"][1][0])
     P = answers_to_cfg(probe)
-    P.update(min_pct=0.004, use_edge=False)    # 작은 물체도 보이게, 윤곽선 자르기 없이 판단
+    P.update(min_pct=0.004, use_edge=False)    
     r0 = process(f, P)
     areas = r0["areas"]
-    # 화면의 20% 넘는 거대한 덩어리 = 빽빽하게 붙은 물체(동전 등)가 하나로 이어진 것
-    # → 이 상태로는 크기를 잴 수 없으니 erosion으로 떼어 본 뒤의 크기로 판단
+    
     giant = len(areas) > 0 and areas.max() > 0.2 * f.size
     st.session_state["_giant"] = bool(giant)
     if giant:
         areas = process(f, dict(P, erode_mode="자동"))["areas"]
     small = len(areas) >= 10 and np.median(areas) < 0.0004 * f.size
     if small and tex_level > 8:
-        # 자갈·모래처럼 질감이 아주 강하면 바닥 알갱이가 잡티 덩어리로 많이 잡혀서 '물체가 작다'고 착각함
-        # → 덩어리 면적(log)에 Otsu를 써서 '잡티 그룹'과 '물체 그룹'으로 나눈 뒤 물체 그룹 크기로 다시 판단
         la = np.log(areas.astype(float))
         q = ((la - la.min()) / max(la.max() - la.min(), 1e-6) * 255).astype(np.uint8)
         cut = np.exp(la.min() + otsu(q) / 255 * (la.max() - la.min()))
         objs = areas[areas > cut]
         small = len(objs) >= 10 and np.median(objs) < 0.0004 * f.size
     ans["q_small"] = QUESTIONS["q_small"][1][int(small)]
+    
     st.session_state["_tex_level"] = tex_level
     no_touch = QUESTIONS["q_touch"][1][0]
     base = dict(answers_to_cfg(dict(ans, q_touch=no_touch, q_same=QUESTIONS["q_same"][1][0])), use_edge=False)
@@ -426,29 +404,24 @@ def auto_answers(f):
     n0, a = r_base["nums"], r_base["areas"]
     touch = giant
     if not giant and not small and n0 > 0:
-        # erosion으로 떼었을 때 개수가 크게 늘면 = 붙어 있던 물체가 많음
         r_ero = process(f, dict(base, erode_mode="자동"))
         touch = r_ero["nums"] >= 1.3 * n0 and r_ero["nums"] - n0 >= 3
         if touch:
-            a = r_ero["areas"]          # 떼어낸 뒤의 크기로 균일한지 판단
-        # 보통 크기의 4배가 넘는 덩어리가 있고, 큰 덩어리가 여럿이면 역시 붙어 있는 것
+            a = r_ero["areas"]          
         elif len(a) >= 3:
             med = np.median(a)
             touch = a.max() > 4 * med and (a > 1.6 * med).sum() >= 3
     ans["q_touch"] = QUESTIONS["q_touch"][1][int(touch)]
 
-    # 7) 크기 균일: 낱개로 보이는 덩어리들의 사분위 범위(IQR)가 중앙값의 30%보다 좁으면 '거의 같다'
     same = False
     if len(a) >= 5:
         med = np.median(a)
-        single = a[a < 1.6 * med]          # 붙어서 커진 덩어리는 빼고
+        single = a[a < 1.6 * med]          
         if len(single) >= 5:
             q25, q50, q75 = np.percentile(single, [25, 50, 75])
             same = (q75 - q25) / q50 < 0.3
     ans["q_same"] = QUESTIONS["q_same"][1][int(same)]
 
-    # 물체 크기(지름) 대략값: 큰 쪽 10% 덩어리 면적의 제곱근 → 배경 추정 크기를 정할 때 씀
-    # (작은 잡티 그룹은 빼고 계산: 면적(log)에 Otsu를 써서 '물체 그룹'만 사용)
     a_obj = a
     if len(a) >= 10:
         la = np.log(a.astype(float))
@@ -458,18 +431,18 @@ def auto_answers(f):
             a_obj = a[a > cut]
     st.session_state["_obj_size"] = float(np.sqrt(np.percentile(a_obj, 90))) if len(a_obj) else 0.0
 
-    # 마지막 확인: 배경 빼기(또는 배경 기준 임계값)를 쓰게 됐는데, 그냥 Otsu로 자른 쪽이 물체를 훨씬 많이
-    # (1.5배 이상) 나누고 거대한 덩어리도 없으면 → 이 사진은 그냥 Otsu가 맞음 (예: 흰 노트북 위 검은 키보드)
+    # 강화된 _plain (Otsu 강제 덮어쓰기) 검사 로직
     final = answers_to_cfg(ans)
     if final["bg_sub"] or final["th_mode"] != "Otsu 자동":
         r_cur = process(f, final)
-        r_plain = process(f, dict(final, bg_sub=False, th_mode="Otsu 자동", use_edge=False))
-        if (r_plain["nums"] >= 1.5 * max(r_cur["nums"], 1) and r_plain["nums"] >= 5
+        r_plain = process(f, dict(final, bg_sub=False, th_mode="Otsu 자동", use_edge=False, area_est=False))
+        # 빛 반사가 있는 환경(r_cur가 더 우수함)에서 _plain으로 잘못 덮어씌워지지 않도록 조건을 더 엄격하게 제한
+        if (r_plain["nums"] > r_cur["nums"] * 2 
+                and r_cur["nums"] < 30 
+                and r_plain["nums"] >= 5 
                 and r_plain["areas"].max() < 0.2 * f.size):
             st.session_state["_plain"] = True
 
-    # 분석 중에 잰 값도 같이 돌려줌. (같은 사진을 다시 올리면 cache 때문에 이 함수가 실행되지 않으므로,
-    #  돌려준 값을 session_state에 넣어야 항상 이 사진의 값으로 설정이 정해짐)
     for key in ["_giant", "_obj_size", "_tex_level", "_img_size", "_plain"]:
         ans[key] = st.session_state[key]
     return ans
@@ -509,7 +482,6 @@ uploaded = sb.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png", "
                             label_visibility="collapsed")
 
 if uploaded is not None:
-    # 새 사진이 올라오면 자동 분석해서 질문 답과 세부 값을 한 번에 정함
     file_id = (uploaded.name, uploaded.size)
     if st.session_state.get("analyzed_file") != file_id:
         with st.spinner("사진을 분석해서 설정을 자동으로 고르는 중..."):
@@ -527,19 +499,16 @@ if uploaded is not None:
         sb.info(f"**조정됨** {msg}")
     sb.button("↺ 처음 값으로 되돌리기", on_click=apply_answers, use_container_width=True)
 
-# 세부 설정: 질문에 답하면 자동으로 정해짐. 직접 바꿀 때만 펼침
 with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
     cap = st.caption
     st.markdown("**0. 사진 분석 결과**")
-    cap("사진을 올리면 자동으로 분석해서 골라 둬요. 실제 사진과 다른 답이 있으면 바꾸세요. "
-        "바꾸면 아래 1~5번 값이 그 답에 맞게 다시 정해져요.")
+    cap("사진을 올리면 자동으로 분석해서 골라 둬요. 실제 사진과 다른 답이 있으면 바꾸세요.")
     for key, (question, opts) in QUESTIONS.items():
         st.radio(question, opts, key=key, on_change=apply_answers)
     st.divider()
 
     st.markdown("**1. 이미지**")
     st.slider("처리용 최대 변 길이 (px)", 256, 4000, step=64, key="max_side")
-    cap("빠른 처리를 위해 사진을 줄여요. 보통은 그대로 두세요.")
 
     st.markdown("**2. 노이즈 제거**")
     st.selectbox("필터", ["Median", "Gaussian", "없음"], key="denoise")
@@ -547,52 +516,36 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
         st.slider("Median kernel 크기 (홀수)", 1, 21, step=2, key="med_k")
     elif st.session_state["denoise"] == "Gaussian":
         st.slider("Gaussian sigma", 0.0, 10.0, step=0.5, key="sigma")
-    cap("바닥 무늬나 잡티가 많이 잡히면 키우세요. 너무 키우면 작은 물체가 뭉개져요.")
     st.checkbox("조명 보정 (배경 빼기)", key="bg_sub")
     if st.session_state["bg_sub"]:
         st.slider("배경 추정 크기 (물체보다 크게)", 11, 151, step=2, key="bg_k")
-    cap("조명이 고르지 않을 때 켜세요. 물체보다 큰 median filter로 배경 밝기를 구하고, "
-        "원본과의 차이만 남겨요. 그러면 조명 차이는 사라지고 물체만 남아요.")
 
     st.markdown("**3. Thresholding**")
     st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)", "둘 다 (|f − 배경| > th)"], key="direction")
     st.radio("임계값 방식", ["Otsu 자동", "배경 기준 자동", "직접 지정"], key="th_mode")
     if st.session_state["th_mode"] == "Otsu 자동":
         st.slider("Otsu 값 보정 (±)", -60, 60, step=1, key="th_offset")
-        cap("Otsu가 구한 값에 더하거나 빼요.")
     elif st.session_state["th_mode"] == "배경 기준 자동":
         st.slider("배경에서 떨어진 정도", 3, 80, step=1, key="bg_margin")
-        cap("히스토그램에서 가장 많은 밝기(= 배경)에서 이만큼 떨어진 곳을 임계값으로 써요. "
-            "작을수록 배경에 가까운 물체까지 잡혀요.")
     else:
         st.slider("임계값", 0, 255, key="th_val")
-        cap("히스토그램의 빨간 선 위치예요.")
-
 
     st.markdown("**4. 모폴로지**")
     st.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k")
-    cap("한 물체가 여러 조각이면 키우고, 옆 물체와 붙으면 줄이세요.")
     st.slider("Opening 크기 (얇은 연결 끊기)", 0, 51, step=2, key="open_k")
-    cap("물체끼리 가늘게 이어져 있으면 키우세요. 가장 얇은 물체보다 크면 그 물체가 사라져요.")
     st.checkbox("Hole filling (물체 안 구멍 채우기)", key="fill")
     st.radio("붙은 물체 떼기 (erosion)", ["끄기", "자동", "직접 지정"], horizontal=True, key="erode_mode")
     if st.session_state["erode_mode"] == "직접 지정":
         st.slider("Erosion 크기", 3, 81, step=2, key="erode_k")
-    cap("동전처럼 빽빽하게 붙은 물체를 깎아서 떼어낸 뒤 셉니다. 자동은 물체 수가 가장 많이 나오는 크기를 찾아요. "
-        "켜면 hole filling은 깎은 뒤에 적용돼요 (물체 사이 빈틈이 채워지지 않게).")
 
     st.checkbox("윤곽선(Sobel)으로 물체 나누기", key="use_edge")
     if st.session_state["use_edge"]:
         st.slider("윤곽선 민감도 (낮을수록 더 잘게 나눔)", 0.3, 1.5, step=0.05, key="edge_scale")
-    cap("mask를 다 만든 뒤 마지막에 Sobel로 찾은 윤곽선을 경계로 잘라서, 맞닿은 물체를 나눠요. "
-        "켜면 erosion 떼기 대신 쓰여요. 한 물체가 잘게 쪼개지면 민감도를 올리세요.")
 
     st.markdown("**5. Connected component**")
     st.slider("최소 면적 (영상 대비 %)", 0.0, 1.0, step=0.001, format="%.3f", key="min_pct")
-    cap("작은 잡티가 세어지면 올리고, 작은 물체가 사라지면 내리세요.")
     st.radio("연결성", ["8-연결", "4-연결"], horizontal=True, key="connectivity")
     st.checkbox("면적으로 개수 보정 (크기가 같은 물체일 때)", key="area_est")
-    cap("덩어리 픽셀 수 ÷ 물체 1개 픽셀 수(중앙값)로 붙은 물체 개수를 셉니다.")
 
 
 # =====================================================================
@@ -663,7 +616,8 @@ with c1:
     colors[0] = 0
     fig, ax = plt.subplots(figsize=(10, 10 * f.shape[0] / f.shape[1]))
     ax.imshow(f, cmap="gray")
-    ax.imshow(np.ma.masked_where(labels == 0, labels), cmap=plt.matplotlib.colors.ListedColormap(colors),
+    # 컬러맵 오류 방지를 위해 mcolors.ListedColormap 사용
+    ax.imshow(np.ma.masked_where(labels == 0, labels), cmap=mcolors.ListedColormap(colors),
               alpha=0.6, interpolation="nearest", vmin=0, vmax=nums)
     for lab, k, (y, x) in zip(idx, est, nd.center_of_mass(labels > 0, labels, idx)):
         ax.text(x, y, f"{lab} (x{k})" if k > 1 else str(lab), color="white",
