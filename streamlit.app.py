@@ -22,6 +22,7 @@ DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
 QUESTIONS = {
     "q_bg": ("배경은 어떤 색인가요?", ["밝다 (흰색, 밝은 회색)", "어둡다 (검정, 짙은 회색)"]),
     "q_texture": ("배경에 무늬나 결이 있나요? (바닥 틈, 천 질감 등)", ["없다 (매끈함)", "있다"]),
+    "q_both": ("배경보다 밝은 물체와 어두운 물체가 섞여 있나요? (회색 바닥 위 흰 블록과 검은 블록 등)", ["아니다", "섞여 있다"]),
     "q_light": ("조명이 고르지 않나요? (한쪽만 햇빛이 비치거나 그림자가 짐)", ["고르다", "고르지 않다"]),
     "q_similar": ("물체 전체가 배경과 거의 같은 색인 것이 섞여 있나요? (흰 종이 위 흰 블록 등)", ["없다", "있다"]),
     "q_small": ("물체 크기는 어떤가요?", ["보통", "아주 작다 (점처럼 흩어짐)"]),
@@ -39,6 +40,7 @@ def answers_to_cfg(ans):
     bright_bg = ans["q_bg"].startswith("밝")
     texture = ans["q_texture"].startswith("있")
     uneven = ans["q_light"].startswith("고르지")
+    both = ans["q_both"].startswith("섞여")
     similar = ans["q_similar"].startswith("있")
     small = ans["q_small"].startswith("아주")
     touch = ans["q_touch"].startswith("붙")
@@ -46,6 +48,8 @@ def answers_to_cfg(ans):
 
     cfg = dict(DEFAULTS)
     cfg["direction"] = "어둡다 (f < th)" if bright_bg else "밝다 (f > th)"
+    if both:                         # 배경보다 밝은 물체도, 어두운 물체도 있음 → 배경과의 차이 |f − 배경|로 자름
+        cfg["direction"] = "둘 다 (|f − 배경| > th)"
     if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고, 윤곽선(edge)도 함께 써서 채움
         cfg.update(th_mode="배경 기준 자동", use_edge=not (same and touch))
     elif small and not bright_bg:    # 어두운 바닥 위 아주 작은 밝은 물체 → 높게 직접 지정
@@ -182,7 +186,17 @@ def process(f, P):
 
     # 조명 보정 (top-hat): 물체보다 큰 크기로 배경 밝기를 구해서 빼면 물체만 남음
     dark_obj = P["direction"].startswith("어둡")
-    if P["tophat"]:
+    if P["direction"].startswith("둘"):
+        # 배경 밝기(히스토그램 최빈값)와의 차이: 밝은 물체든 어두운 물체든 배경과 다르면 커짐
+        if P["tophat"]:   # 조명 보정까지: closing(어두운 물체 지운 배경) − opening(밝은 물체 지운 배경)
+            se = (P["tophat_k"], P["tophat_k"])
+            f_th = (nd.grey_closing(f_denoised, size=se).astype(int)
+                    - nd.grey_opening(f_denoised, size=se)).clip(0, 255).astype(np.uint8)
+        else:
+            bg = int(np.argmax(np.bincount(f_denoised.ravel(), minlength=256)))
+            f_th = np.abs(f_denoised.astype(int) - bg).clip(0, 255).astype(np.uint8)
+        obj_is_dark = False
+    elif P["tophat"]:
         se = (P["tophat_k"], P["tophat_k"])
         if dark_obj:   # black-hat: closing(배경) − 영상
             f_th = (nd.grey_closing(f_denoised, size=se).astype(int) - f_denoised).clip(0, 255).astype(np.uint8)
@@ -285,6 +299,15 @@ def auto_answers(f):
     texture = np.median(local_std[np.abs(fd.astype(int) - mode) < 20]) > 1.5
     ans["q_texture"] = QUESTIONS["q_texture"][1][int(texture)]
 
+    # 2-1) 밝은 물체와 어두운 물체가 섞임: 밝은 배경인데 배경보다 확실히 더 밝은 덩어리가 2개 이상 있으면
+    both = False
+    if bright_bg and mode < 215:
+        brighter = nd.binary_opening(fd.astype(int) > mode + 30, structure=np.ones((5, 5)))
+        lab_b, n_b = nd.label(brighter)
+        sizes = np.bincount(lab_b.ravel(), minlength=n_b + 1)[1:]
+        both = (sizes >= 0.0003 * fd.size).sum() >= 2
+    ans["q_both"] = QUESTIONS["q_both"][1][int(both)]
+
     # 3) 조명: 작게 줄인 사진에서 물체를 지운 배경 밝기(closing/opening)의 변화 폭
     small_img = np.array(Image.fromarray(fd).resize((max(8, w // 8), max(8, h // 8))))
     k = max(3, min(small_img.shape) // 6)
@@ -325,7 +348,7 @@ def auto_answers(f):
         # 보통 크기의 4배가 넘는 덩어리가 있고, 큰 덩어리가 여럿이면 역시 붙어 있는 것
         elif len(a) >= 3:
             med = np.median(a)
-            touch = a.max() > 4 * med and (a > 1.6 * med).sum() >= 2
+            touch = a.max() > 4 * med and (a > 1.6 * med).sum() >= 3
     ans["q_touch"] = QUESTIONS["q_touch"][1][int(touch)]
 
     # 7) 크기 균일: 낱개로 보이는 덩어리들의 사분위 범위(IQR)가 중앙값의 30%보다 좁으면 '거의 같다'
@@ -418,7 +441,7 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
         "배경 밝기를 구하고, 원본과의 차이만 남겨요.")
 
     st.markdown("**3. Thresholding**")
-    st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)"], key="direction")
+    st.radio("물체가 배경보다…", ["어둡다 (f < th)", "밝다 (f > th)", "둘 다 (|f − 배경| > th)"], key="direction")
     st.radio("임계값 방식", ["Otsu 자동", "배경 기준 자동", "직접 지정"], key="th_mode")
     if st.session_state["th_mode"] == "Otsu 자동":
         st.slider("Otsu 값 보정 (±)", -60, 60, step=1, key="th_offset")
