@@ -15,7 +15,7 @@ st.set_page_config(page_title="Object Counting", layout="wide")
 DEFAULTS = dict(max_side=1000, denoise="Median", med_k=5, sigma=2.0,
                 tophat=False, tophat_k=51,
                 direction="어둡다 (f < th)", th_mode="Otsu 자동", th_val=150, th_offset=0, bg_margin=20,
-                use_edge=False, edge_scale=0.5,
+                use_edge=False, edge_scale=0.7,
                 close_k=5, fill=True, open_k=5, erode_mode="끄기", erode_k=21,
                 min_pct=0.05, connectivity="8-연결", area_est=False)
 
@@ -47,7 +47,7 @@ def answers_to_cfg(ans):
     cfg = dict(DEFAULTS)
     cfg["direction"] = "어둡다 (f < th)" if bright_bg else "밝다 (f > th)"
     if similar:                      # 배경과 비슷한 물체 → 배경 바로 옆에서 자르고, 윤곽선(edge)도 함께 써서 채움
-        cfg.update(th_mode="배경 기준 자동", use_edge=True)
+        cfg.update(th_mode="배경 기준 자동", use_edge=not (same and touch))
     elif small and not bright_bg:    # 어두운 바닥 위 아주 작은 밝은 물체 → 높게 직접 지정
         cfg.update(th_mode="직접 지정", th_val=170)
     if texture and not small:
@@ -202,14 +202,6 @@ def process(f, P):
     else:
         th_val = P["th_val"]
     f_mask = f_th < th_val if obj_is_dark else f_th > th_val
-    if P["use_edge"]:
-        # 밝기로는 배경과 구분이 안 되는 물체도 윤곽선은 있음 → Sobel로 윤곽선을 찾고, 닫힌 윤곽 안을 채워서 더함
-        fd = f_denoised.astype(float)
-        grad = np.hypot(nd.sobel(fd, axis=0), nd.sobel(fd, axis=1))
-        grad8 = (grad / max(grad.max(), 1e-6) * 255).astype(np.uint8)
-        edge = grad8 > otsu(grad8) * P["edge_scale"]
-        edge = nd.binary_fill_holes(nd.binary_closing(edge, structure=np.ones((5, 5))))
-        f_mask = f_mask | edge
     # 순서: closing(조각 잇기) → opening(얇은 연결 끊기) → [erosion] → hole filling
     if P["close_k"] > 0:
         f_mask = nd.binary_closing(f_mask, structure=np.ones((P["close_k"], P["close_k"])))
@@ -220,21 +212,39 @@ def process(f, P):
     structure = None if P["connectivity"] == "4-연결" else np.ones((3, 3))
     min_area = int(P["min_pct"] / 100 * f.size)
     ek = 0
-    if P["erode_mode"] == "자동":
+    if P["erode_mode"] == "자동" and not P["use_edge"]:
         # erosion 크기를 바꿔 가며 물체 수가 가장 많이 나오는 크기를 고름
         counts = [(k, label_cores(f_mask, k, P["fill"], structure, min_area)[2]) for k in range(3, 82, 4)]
         best = max(c for _, c in counts)
         ek = next(k for k, c in counts if c >= 0.97 * best)
     elif P["erode_mode"] == "직접 지정":
         ek = P["erode_k"]
-    labels, core, _ = label_cores(f_mask, ek, P["fill"], structure, min_area)
-    if ek > 0:
-        # 깎인 부분을 다시 키워서 원래 물체 영역에 번호를 돌려줌 (dilation)
-        region = f_mask | nd.binary_dilation(core, np.ones((ek, ek)))
-        labels = nd.grey_dilation(labels, footprint=np.ones((ek + 2, ek + 2))) * region
-        mask_shown = region
+    if P["use_edge"]:
+        # 마지막 단계에서 Sobel 윤곽선으로 붙은 물체 사이를 잘라냄
+        # (mask를 다 만든 뒤 윤곽선 픽셀을 빼서 경계를 만들고 → labeling → 잘린 선만큼 다시 채움)
+        ek = 0
+        full = nd.binary_fill_holes(f_mask) if P["fill"] else f_mask
+        fd = f_denoised.astype(float)
+        grad = np.hypot(nd.sobel(fd, axis=0), nd.sobel(fd, axis=1))      # gradient 크기 = sqrt(gx² + gy²)
+        grad8 = (grad / max(grad.max(), 1e-6) * 255).astype(np.uint8)
+        edge = grad8 > otsu(grad8) * P["edge_scale"]
+        cut = full & ~edge
+        labels, n = nd.label(cut, structure=structure)
+        a = np.bincount(labels.ravel(), minlength=n + 1)[1:]
+        keep0 = np.zeros(n + 1, bool)
+        keep0[1:] = a >= min_area
+        labels = np.where(keep0[labels], labels, 0)
+        labels = nd.grey_dilation(labels, size=(5, 5)) * full             # 잘린 경계선 픽셀을 이웃 번호로 채움
+        mask_shown = cut
     else:
-        mask_shown = core
+        labels, core, _ = label_cores(f_mask, ek, P["fill"], structure, min_area)
+        if ek > 0:
+            # 깎인 부분을 다시 키워서 원래 물체 영역에 번호를 돌려줌 (dilation)
+            region = f_mask | nd.binary_dilation(core, np.ones((ek, ek)))
+            labels = nd.grey_dilation(labels, footprint=np.ones((ek + 2, ek + 2))) * region
+            mask_shown = region
+        else:
+            mask_shown = core
     nums = int(labels.max())
 
     # 작은 조각 제거 후 번호 다시 매기기
@@ -296,13 +306,13 @@ def auto_answers(f):
     probe = dict(ans, q_small=QUESTIONS["q_small"][1][0], q_touch=QUESTIONS["q_touch"][1][0],
                  q_same=QUESTIONS["q_same"][1][0])
     P = answers_to_cfg(probe)
-    P["min_pct"] = 0.004                       # 작은 물체도 보이게
+    P.update(min_pct=0.004, use_edge=False)    # 작은 물체도 보이게, 윤곽선 자르기 없이 판단
     r0 = process(f, P)
     areas = r0["areas"]
     small = len(areas) >= 10 and np.median(areas) < 0.0004 * f.size
     ans["q_small"] = QUESTIONS["q_small"][1][int(small)]
     no_touch = QUESTIONS["q_touch"][1][0]
-    base = answers_to_cfg(dict(ans, q_touch=no_touch, q_same=QUESTIONS["q_same"][1][0]))
+    base = dict(answers_to_cfg(dict(ans, q_touch=no_touch, q_same=QUESTIONS["q_same"][1][0])), use_edge=False)
     r_base = process(f, base)
     n0, a = r_base["nums"], r_base["areas"]
     touch = False
@@ -421,10 +431,6 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
         st.slider("임계값", 0, 255, key="th_val")
         cap("히스토그램의 빨간 선 위치예요.")
 
-    st.checkbox("윤곽선(edge)도 함께 쓰기", key="use_edge")
-    if st.session_state["use_edge"]:
-        st.slider("윤곽선 민감도 (낮을수록 흐린 윤곽까지)", 0.2, 1.5, step=0.05, key="edge_scale")
-    cap("배경과 색이 거의 같은 물체는 밝기로 안 잡혀요. Sobel로 윤곽선을 찾아서, 닫힌 윤곽 안을 채워 물체에 더해요.")
 
     st.markdown("**4. 모폴로지**")
     st.slider("Closing 크기 (조각 잇기)", 0, 51, step=2, key="close_k")
@@ -437,6 +443,12 @@ with sb.expander("⚙️ 세부 설정 (자동으로 정해져요)"):
         st.slider("Erosion 크기", 3, 81, step=2, key="erode_k")
     cap("동전처럼 빽빽하게 붙은 물체를 깎아서 떼어낸 뒤 셉니다. 자동은 물체 수가 가장 많이 나오는 크기를 찾아요. "
         "켜면 hole filling은 깎은 뒤에 적용돼요 (물체 사이 빈틈이 채워지지 않게).")
+
+    st.checkbox("윤곽선(Sobel)으로 물체 나누기", key="use_edge")
+    if st.session_state["use_edge"]:
+        st.slider("윤곽선 민감도 (낮을수록 더 잘게 나눔)", 0.3, 1.5, step=0.05, key="edge_scale")
+    cap("mask를 다 만든 뒤 마지막에 Sobel로 찾은 윤곽선을 경계로 잘라서, 맞닿은 물체를 나눠요. "
+        "켜면 erosion 떼기 대신 쓰여요. 한 물체가 잘게 쪼개지면 민감도를 올리세요.")
 
     st.markdown("**5. Connected component**")
     st.slider("최소 면적 (영상 대비 %)", 0.0, 1.0, step=0.001, format="%.3f", key="min_pct")
@@ -497,7 +509,8 @@ with c[0]:
     fig.tight_layout()
     put(fig)
 with c[1]:
-    put(fig_img(R["mask_shown"], "binary mask" + (f" (erosion {ek})" if ek else "")))
+    put(fig_img(R["mask_shown"], "binary mask" + (f" (erosion {ek})" if ek else "")
+                + (" (Sobel edge cut)" if P["use_edge"] else "")))
 
 # --- 4단계 ---
 st.subheader(f"4. Connected components — {total}개" + (f" (component {nums}개 + 면적 보정)" if total != nums else ""))
