@@ -179,6 +179,41 @@ def label_cores(mask, ek, fill, structure, min_area):
     return lab, core, int((areas >= max(1, min_area * 0.2)).sum())
 
 
+def split_each(labels, min_area, kmax=41):
+    """보통보다 큰 덩어리마다 erosion 크기를 따로 골라서(가장 많이 나뉘는 크기) 떼어낸 뒤,
+    원래 덩어리 안에서만 다시 키움(geodesic dilation). 겹친 낙엽처럼 덩어리마다 붙은 정도가 다를 때 씀"""
+    out = np.zeros_like(labels); nxt = 1
+    areas = np.bincount(labels.ravel())[1:]
+    med = np.median(areas) if len(areas) else 0
+    for i, sl in enumerate(nd.find_objects(labels), 1):
+        if sl is None: continue
+        sl = tuple(slice(max(s.start-2,0), s.stop+2) for s in sl)
+        comp = labels[sl] == i
+        area = comp.sum()
+        best = (1, None, 0)
+        if area > 1.5 * med:
+            for k in range(3, kmax + 1, 2):
+                core = nd.binary_erosion(comp, np.ones((k, k)))
+                if not core.any(): break
+                lab, n = nd.label(core)
+                a = np.bincount(lab.ravel())[1:]
+                good = (a >= max(min_area * 0.1, 0.02 * area)).sum()
+                if good > best[0]:
+                    keep = np.zeros(n + 1, bool); keep[1:] = a >= max(min_area * 0.1, 0.02 * area)
+                    best = (good, np.where(keep[lab], lab, 0), k)
+        if best[1] is None:
+            out[sl][comp] = nxt; nxt += 1; continue
+        lab = best[1]
+        for _ in range(best[2] + 2):           # geodesic dilation: 원래 덩어리 안에서만 키움
+            grown = nd.grey_dilation(lab, size=(3, 3))
+            lab = np.where((lab == 0) & comp, grown, lab)
+        lab[~comp] = 0
+        for j in range(1, lab.max() + 1):
+            m = lab == j
+            if m.any(): out[sl][m] = nxt; nxt += 1
+    return out
+
+
 def process(f, P):
     """HW5 과정 2~4단계 + 개수 세기. P는 세부 설정 값(dict)"""
     param = P["med_k"] if P["denoise"] == "Median" else (P["sigma"] if P["denoise"] == "Gaussian" else 0)
@@ -259,6 +294,8 @@ def process(f, P):
             mask_shown = region
         else:
             mask_shown = core
+        if P["erode_mode"] == "자동":
+            labels = split_each(labels, min_area)   # 전체 erosion으로 안 떨어진 큰 덩어리는 따로 한 번 더
     nums = int(labels.max())
 
     # 작은 조각 제거 후 번호 다시 매기기
